@@ -317,25 +317,42 @@ def main():
     logger.info("Loading dataset ...")
     dataset = LazySupervisedDataset(processor, data_args=data_args)
     logger.info("Dataset loaded (%d samples) in %.1fs", len(dataset), _time.time() - _t0)
-    if data_args.data_flatten or data_args.data_packing:
-        from jax_qwenvl.data.data_processor import FlattenedDataCollatorForSupervisedDataset
-        merge_size = getattr(processor.image_processor, "merge_size", 2)
-        collator = FlattenedDataCollatorForSupervisedDataset(
-            tokenizer=processor.tokenizer,
-            spatial_merge_size=merge_size,
-        )
-        logger.info("Using FlattenedDataCollator (data_flatten=%s, data_packing=%s)",
-                     data_args.data_flatten, data_args.data_packing)
-    else:
-        merge_size = getattr(processor.image_processor, "merge_size", 2)
-        collator = DataCollatorForSupervisedDataset(
-            tokenizer=processor.tokenizer,
-            spatial_merge_size=merge_size,
-        )
 
     dataset_size = len(dataset)
     num_dp_devices = mesh.shape['dp']
     batch_size = training_args.per_device_train_batch_size * num_dp_devices
+
+    # Compute max vision tensor sizes for fixed-shape padding (avoids XLA recompilation)
+    vision_cfg = config.vision_config
+    merge_size = getattr(processor.image_processor, "merge_size", 2)
+    max_patches_per_image = data_args.max_pixels // (vision_cfg.patch_size ** 2)
+    max_total_patches = batch_size * max_patches_per_image
+    # Ensure divisible by merge_size² for PatchMerger reshape safety
+    merge_sq = vision_cfg.spatial_merge_size ** 2
+    max_total_patches = ((max_total_patches + merge_sq - 1) // merge_sq) * merge_sq
+    max_num_images = batch_size  # assume each sample has at most 1 image
+    logger.info("Vision padding: max_total_patches=%d, max_num_images=%d",
+                max_total_patches, max_num_images)
+
+    if data_args.data_flatten or data_args.data_packing:
+        from jax_qwenvl.data.data_processor import FlattenedDataCollatorForSupervisedDataset
+        collator = FlattenedDataCollatorForSupervisedDataset(
+            tokenizer=processor.tokenizer,
+            spatial_merge_size=merge_size,
+            max_total_patches=max_total_patches,
+            max_num_images=max_num_images,
+            model_max_length=training_args.model_max_length,
+        )
+        logger.info("Using FlattenedDataCollator (data_flatten=%s, data_packing=%s)",
+                     data_args.data_flatten, data_args.data_packing)
+    else:
+        collator = DataCollatorForSupervisedDataset(
+            tokenizer=processor.tokenizer,
+            spatial_merge_size=merge_size,
+            max_total_patches=max_total_patches,
+            max_num_images=max_num_images,
+            model_max_length=training_args.model_max_length,
+        )
     steps_per_epoch = max(dataset_size // batch_size, 1)
     total_steps = steps_per_epoch * training_args.num_train_epochs
     logger.info(
