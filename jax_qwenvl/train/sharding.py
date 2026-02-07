@@ -131,6 +131,11 @@ def shard_batch(batch, mesh: Mesh):
             return None
         if name == 'position_ids':
             return jax.device_put(x, pos_sharding)
+        # Vision fields: replicate (not batch-sharded)
+        if name in ('pixel_values', 'image_grid_thw', 'pixel_values_videos', 'video_grid_thw',
+                     'image_pos_ids_2d', 'image_pos_ids_1d', 'image_cu_seqlens',
+                     'video_pos_ids_2d', 'video_pos_ids_1d', 'video_cu_seqlens'):
+            return jax.device_put(x, replicated)
         if x.ndim >= 2:
             return jax.device_put(x, dp_sharding)
         if x.ndim == 1:

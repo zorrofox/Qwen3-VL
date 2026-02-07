@@ -46,7 +46,7 @@ def cross_entropy_loss(
 # Training step
 # ---------------------------------------------------------------------------
 
-@partial(jax.jit, donate_argnums=(0,))
+@partial(jax.jit, donate_argnums=(0, 1))
 def train_step(state, batch):
     """Single JIT-compiled training step.
 
@@ -83,6 +83,12 @@ def train_step(state, batch):
             pixel_values_videos=batch.pixel_values_videos,
             video_grid_thw=batch.video_grid_thw,
             labels=batch.labels,
+            image_pos_ids_2d=batch.image_pos_ids_2d,
+            image_pos_ids_1d=batch.image_pos_ids_1d,
+            image_cu_seqlens=batch.image_cu_seqlens,
+            video_pos_ids_2d=batch.video_pos_ids_2d,
+            video_pos_ids_1d=batch.video_pos_ids_1d,
+            video_cu_seqlens=batch.video_cu_seqlens,
         )
         return loss
 
@@ -96,7 +102,7 @@ def train_step(state, batch):
 # Training step with gradient accumulation
 # ---------------------------------------------------------------------------
 
-@partial(jax.jit, donate_argnums=(0,))
+@partial(jax.jit, donate_argnums=(0, 1))
 def train_step_with_accumulation(
     state,
     micro_batches,
@@ -129,6 +135,12 @@ def train_step_with_accumulation(
                 pixel_values_videos=micro_batch.pixel_values_videos,
                 video_grid_thw=micro_batch.video_grid_thw,
                 labels=micro_batch.labels,
+                image_pos_ids_2d=micro_batch.image_pos_ids_2d,
+                image_pos_ids_1d=micro_batch.image_pos_ids_1d,
+                image_cu_seqlens=micro_batch.image_cu_seqlens,
+                video_pos_ids_2d=micro_batch.video_pos_ids_2d,
+                video_pos_ids_1d=micro_batch.video_pos_ids_1d,
+                video_cu_seqlens=micro_batch.video_cu_seqlens,
             )
             return loss
 

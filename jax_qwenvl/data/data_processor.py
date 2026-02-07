@@ -18,6 +18,7 @@ import transformers
 from . import data_list
 from .rope2d import get_rope_index_25, get_rope_index_2, get_rope_index_3
 from ..types import Batch
+from ..model.vit import precompute_vision_position_ids, precompute_vision_cu_seqlens
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = 151655
@@ -221,10 +222,13 @@ def preprocess_qwen_visual(
     messages = _build_messages(source, base_path)
 
     full_result = processor.apply_chat_template(
-        messages, tokenize=True, return_dict=True, return_tensors="np"
+        messages, tokenize=True, return_dict=True, return_tensors="pt"
     )
 
     input_ids = full_result["input_ids"]
+    # Convert torch tensor / list to numpy
+    if hasattr(input_ids, 'numpy'):
+        input_ids = input_ids.numpy()
     if isinstance(input_ids, list):
         input_ids = np.array(input_ids, dtype=np.int32).reshape(1, -1)
     elif input_ids.ndim == 1:
@@ -465,7 +469,7 @@ class LazySupervisedDataset:
     def _get_packed_item(self, sources) -> Dict[str, np.ndarray]:
 
         if isinstance(sources, dict):
-            if isinstance(source, dict):
+            if isinstance(sources, dict):
                 sources = [sources]
             assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
             return self._get_item(sources)
@@ -571,6 +575,7 @@ class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
+    spatial_merge_size: int = 2
 
     def __call__(self, instances: Sequence[Dict]) -> Batch:
         input_ids, labels, position_ids = tuple(
@@ -601,6 +606,9 @@ class DataCollatorForSupervisedDataset(object):
             for instance in instances
             if "pixel_values_videos" in instance
         )
+        image_pos_ids_2d = None
+        image_pos_ids_1d = None
+        image_cu_seqlens = None
         if len(images) != 0:
             concat_images = np.concatenate([image for image in images], axis=0)
             grid_thw = [
@@ -609,10 +617,18 @@ class DataCollatorForSupervisedDataset(object):
                 if "image_grid_thw" in instance
             ]
             grid_thw = np.concatenate(grid_thw, axis=0)
+            # Precompute vision position IDs on host (outside JIT)
+            image_pos_ids_2d, image_pos_ids_1d = precompute_vision_position_ids(
+                grid_thw, self.spatial_merge_size
+            )
+            image_cu_seqlens = precompute_vision_cu_seqlens(grid_thw)
         else:
             concat_images = None
             grid_thw = None
 
+        video_pos_ids_2d = None
+        video_pos_ids_1d = None
+        video_cu_seqlens = None
         if len(videos) != 0:
             concat_videos = np.concatenate([video for video in videos], axis=0)
             video_grid_thw = [
@@ -621,6 +637,10 @@ class DataCollatorForSupervisedDataset(object):
                 if "video_grid_thw" in instance
             ]
             video_grid_thw = np.concatenate(video_grid_thw, axis=0)
+            video_pos_ids_2d, video_pos_ids_1d = precompute_vision_position_ids(
+                video_grid_thw, self.spatial_merge_size
+            )
+            video_cu_seqlens = precompute_vision_cu_seqlens(video_grid_thw)
         else:
             concat_videos = None
             video_grid_thw = None
@@ -634,6 +654,12 @@ class DataCollatorForSupervisedDataset(object):
             image_grid_thw=grid_thw,
             pixel_values_videos=concat_videos,
             video_grid_thw=video_grid_thw,
+            image_pos_ids_2d=image_pos_ids_2d,
+            image_pos_ids_1d=image_pos_ids_1d,
+            image_cu_seqlens=image_cu_seqlens,
+            video_pos_ids_2d=video_pos_ids_2d,
+            video_pos_ids_1d=video_pos_ids_1d,
+            video_cu_seqlens=video_cu_seqlens,
         )
 
 
@@ -642,6 +668,7 @@ class FlattenedDataCollatorForSupervisedDataset(object):
     """Collate examples into packed sequence with multi-modal support."""
 
     tokenizer: transformers.PreTrainedTokenizer
+    spatial_merge_size: int = 2
 
     def __call__(self, instances: Sequence[Dict]) -> Batch:
         input_ids, labels, position_ids, attention_mask = tuple(
@@ -673,6 +700,9 @@ class FlattenedDataCollatorForSupervisedDataset(object):
             for instance in instances
             if "pixel_values_videos" in instance
         )
+        image_pos_ids_2d = None
+        image_pos_ids_1d = None
+        image_cu_seqlens = None
         if len(images) != 0:
             concat_images = np.concatenate([image for image in images], axis=0)
             grid_thw = [
@@ -681,10 +711,17 @@ class FlattenedDataCollatorForSupervisedDataset(object):
                 if "image_grid_thw" in instance
             ]
             grid_thw = np.concatenate(grid_thw, axis=0)
+            image_pos_ids_2d, image_pos_ids_1d = precompute_vision_position_ids(
+                grid_thw, self.spatial_merge_size
+            )
+            image_cu_seqlens = precompute_vision_cu_seqlens(grid_thw)
         else:
             concat_images = None
             grid_thw = None
 
+        video_pos_ids_2d = None
+        video_pos_ids_1d = None
+        video_cu_seqlens = None
         if len(videos) != 0:
             concat_videos = np.concatenate([video for video in videos], axis=0)
             video_grid_thw = [
@@ -693,6 +730,10 @@ class FlattenedDataCollatorForSupervisedDataset(object):
                 if "video_grid_thw" in instance
             ]
             video_grid_thw = np.concatenate(video_grid_thw, axis=0)
+            video_pos_ids_2d, video_pos_ids_1d = precompute_vision_position_ids(
+                video_grid_thw, self.spatial_merge_size
+            )
+            video_cu_seqlens = precompute_vision_cu_seqlens(video_grid_thw)
         else:
             concat_videos = None
             video_grid_thw = None
@@ -706,6 +747,12 @@ class FlattenedDataCollatorForSupervisedDataset(object):
             image_grid_thw=grid_thw,
             pixel_values_videos=concat_videos,
             video_grid_thw=video_grid_thw,
+            image_pos_ids_2d=image_pos_ids_2d,
+            image_pos_ids_1d=image_pos_ids_1d,
+            image_cu_seqlens=image_cu_seqlens,
+            video_pos_ids_2d=video_pos_ids_2d,
+            video_pos_ids_1d=video_pos_ids_1d,
+            video_cu_seqlens=video_cu_seqlens,
         )
 
 
