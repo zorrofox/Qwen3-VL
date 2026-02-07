@@ -267,6 +267,17 @@ def main():
     )
     params = loaded["params"]
 
+    # Cast to bfloat16 if requested (halves memory for params + optimizer)
+    param_dtype = jnp.bfloat16 if training_args.bf16 else jnp.float32
+    if training_args.bf16:
+        logger.info("Casting parameters to bfloat16 ...")
+        params = jax.tree_util.tree_map(
+            lambda x: x.astype(jnp.bfloat16)
+            if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating)
+            else x,
+            params,
+        )
+
     # 7. Merge with initialised LoRA params if needed
     if lora_rank > 0:
         logger.info("LoRA enabled (rank=%d, alpha=%.1f). Initialising LoRA params ...",

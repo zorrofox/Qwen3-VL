@@ -196,6 +196,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         visual_pos_masks = None
 
         if pixel_values is not None and image_grid_thw is not None:
+            # Cast pixel_values to match param dtype (e.g. bfloat16)
+            pixel_values = pixel_values.astype(inputs_embeds.dtype)
             image_embeds, ds_feats = VisionModel(
                 config=cfg.vision_config,
                 gradient_checkpointing=self.gradient_checkpointing,
@@ -211,6 +213,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             all_deepstack_features = ds_feats
 
         if pixel_values_videos is not None and video_grid_thw is not None:
+            # Cast video pixel_values to match param dtype
+            pixel_values_videos = pixel_values_videos.astype(inputs_embeds.dtype)
             video_embeds, ds_feats_v = VisionModel(
                 config=cfg.vision_config,
                 gradient_checkpointing=self.gradient_checkpointing,

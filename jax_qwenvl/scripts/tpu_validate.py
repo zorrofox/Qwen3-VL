@@ -3,12 +3,14 @@
 Runs 8 tests on real TPU hardware to verify the full training stack:
 1. TPU device detection
 2. Model weight loading from HuggingFace
-3. Forward inference
+3. Forward inference (bfloat16)
 4. SPMD sharding (DP mode)
-5. Single training step
+5. Single training step (bfloat16)
 6. Checkpoint save/restore round-trip
 7. Gradient accumulation
 8. FSDP sharding mode
+
+All tests use bfloat16 parameters to match production TPU training.
 
 Usage:
     python3 -m jax_qwenvl.scripts.tpu_validate
@@ -35,6 +37,7 @@ MODEL_HF_ID = "Qwen/Qwen3-VL-2B-Instruct"
 MODEL_PATH = None  # Set after snapshot_download
 SEQ_LEN = 32
 BATCH_SIZE = 1  # Single-device tests; multi-device tests use num_devices
+PARAM_DTYPE = jnp.bfloat16  # Use bfloat16 for all tests
 
 results = []
 
@@ -59,6 +62,16 @@ def record(name: str, passed: bool, detail: str = ""):
     logger.info("[%s] %s %s", status, name, f"-- {detail}" if detail else "")
 
 
+def _cast_to_bf16(params):
+    """Cast all float parameters to bfloat16."""
+    return jax.tree_util.tree_map(
+        lambda x: x.astype(jnp.bfloat16)
+        if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating)
+        else x,
+        params,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test 1: TPU device detection
 # ---------------------------------------------------------------------------
@@ -81,10 +94,20 @@ def test_weight_loading():
     loaded = load_hf_weights(MODEL_PATH, config, lora_rank=0)
     params = loaded["params"]
 
-    # Count parameters
-    num_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
-    detail = f"num_params={num_params:,}, config.text.hidden_size={config.text_config.hidden_size}"
-    record("Model weight loading", num_params > 0, detail)
+    # Cast to bfloat16
+    params = _cast_to_bf16(params)
+
+    # Count parameters and verify dtype
+    leaves = jax.tree_util.tree_leaves(params)
+    num_params = sum(x.size for x in leaves)
+    first_dtype = leaves[0].dtype
+    mem_gb = sum(x.size * x.dtype.itemsize for x in leaves) / 1e9
+    detail = (
+        f"num_params={num_params:,}, dtype={first_dtype}, "
+        f"memory={mem_gb:.2f}GB, "
+        f"config.text.hidden_size={config.text_config.hidden_size}"
+    )
+    record("Model weight loading (bf16)", num_params > 0 and first_dtype == jnp.bfloat16, detail)
     return config, params
 
 
@@ -114,7 +137,7 @@ def test_forward(config, params):
         f"elapsed={elapsed:.2f}s"
     )
     record(
-        "Forward inference",
+        "Forward inference (bf16)",
         logits.shape == (BATCH_SIZE, SEQ_LEN, config.text_config.vocab_size)
         and not has_nan
         and not has_inf,
@@ -160,7 +183,7 @@ def test_spmd_sharding(params, num_devices):
     with mesh:
         sharded_batch = shard_batch(dummy_batch, mesh)
 
-    detail = f"mesh={mesh}, param_sharding={sharding_info}"
+    detail = f"mesh={mesh}, param_sharding={sharding_info}, dtype={first_leaf.dtype}"
     record("SPMD sharding (DP)", True, detail)
     return mesh, sharded_params
 
@@ -196,6 +219,12 @@ def test_train_step(model, params, num_devices):
     )
     state = create_train_state(model, sharded_params, optimizer)
 
+    # Check optimizer state dtype
+    opt_leaves = jax.tree_util.tree_leaves(state.opt_state)
+    opt_float_leaves = [x for x in opt_leaves if hasattr(x, 'dtype') and jnp.issubdtype(x.dtype, jnp.floating)]
+    opt_dtype = opt_float_leaves[0].dtype if opt_float_leaves else "none"
+    opt_mem_gb = sum(x.size * x.dtype.itemsize for x in opt_float_leaves) / 1e9
+
     # Create a batch with labels (batch_size = num_devices for DP)
     dp_batch = num_devices
     dummy_batch = Batch(
@@ -223,9 +252,23 @@ def test_train_step(model, params, num_devices):
 
     is_finite = np.isfinite(loss_val)
     step_incremented = int(new_state.step) == 1
-    detail = f"loss={loss_val:.4f}, step={int(new_state.step)}, elapsed={elapsed:.2f}s"
-    record("Single training step", is_finite and step_incremented, detail)
-    return state, mesh
+    detail = (
+        f"loss={loss_val:.4f}, step={int(new_state.step)}, "
+        f"param_dtype={first_dtype(new_state.params)}, "
+        f"opt_dtype={opt_dtype}, opt_mem={opt_mem_gb:.2f}GB, "
+        f"elapsed={elapsed:.2f}s"
+    )
+    record("Single training step (bf16)", is_finite and step_incremented, detail)
+    # Return new_state (not state) because train_step donates the old state buffers
+    return new_state, mesh
+
+
+def first_dtype(params):
+    """Get dtype of the first float leaf in params."""
+    for leaf in jax.tree_util.tree_leaves(params):
+        if hasattr(leaf, 'dtype') and jnp.issubdtype(leaf.dtype, jnp.floating):
+            return leaf.dtype
+    return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -258,10 +301,11 @@ def test_checkpoint(state, mesh):
         orig_leaves = jax.tree_util.tree_leaves(state.params)
         rest_leaves = jax.tree_util.tree_leaves(restored.params)
         max_diff = max(
-            float(jnp.max(jnp.abs(o - r)))
+            float(jnp.max(jnp.abs(o.astype(jnp.float32) - r.astype(jnp.float32))))
             for o, r in zip(orig_leaves[:5], rest_leaves[:5])
         )
-        detail = f"max_diff={max_diff}, step={int(restored.step)}"
+        restored_dtype = first_dtype(restored.params)
+        detail = f"max_diff={max_diff}, step={int(restored.step)}, dtype={restored_dtype}"
         record("Checkpoint round-trip", max_diff == 0.0, detail)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -390,7 +434,7 @@ def test_fsdp(model, params, num_devices):
 
     is_finite = np.isfinite(loss_val)
     detail = f"loss={loss_val:.4f}, kernel_sharding={kernel_sharding}, elapsed={elapsed:.2f}s"
-    record("FSDP mode training", is_finite, detail)
+    record("FSDP mode training (bf16)", is_finite, detail)
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +442,7 @@ def test_fsdp(model, params, num_devices):
 # ---------------------------------------------------------------------------
 def main():
     logger.info("=" * 60)
-    logger.info("JAX Qwen3-VL TPU Validation")
+    logger.info("JAX Qwen3-VL TPU Validation (bfloat16)")
     logger.info("=" * 60)
 
     # Test 1: TPU devices
@@ -413,28 +457,28 @@ def main():
         download_model()
     except Exception:
         logger.error("Failed to download model: %s", traceback.format_exc())
-        record("Model weight loading", False, "Failed to download model")
+        record("Model weight loading (bf16)", False, "Failed to download model")
         _print_summary()
         return
 
-    # Test 2: Weight loading
+    # Test 2: Weight loading (with bf16 cast)
     config, params = None, None
     try:
         config, params = test_weight_loading()
     except Exception:
-        record("Model weight loading", False, traceback.format_exc())
+        record("Model weight loading (bf16)", False, traceback.format_exc())
 
     if config is None or params is None:
         logger.error("Cannot proceed without model weights. Aborting.")
         _print_summary()
         return
 
-    # Test 3: Forward inference
+    # Test 3: Forward inference (bf16)
     model = None
     try:
         model = test_forward(config, params)
     except Exception:
-        record("Forward inference", False, traceback.format_exc())
+        record("Forward inference (bf16)", False, traceback.format_exc())
 
     if model is None:
         from jax_qwenvl.model import Qwen3VLForConditionalGeneration
@@ -446,12 +490,12 @@ def main():
     except Exception:
         record("SPMD sharding (DP)", False, traceback.format_exc())
 
-    # Test 5: Single training step
+    # Test 5: Single training step (bf16)
     state, mesh = None, None
     try:
         state, mesh = test_train_step(model, params, num_devices)
     except Exception:
-        record("Single training step", False, traceback.format_exc())
+        record("Single training step (bf16)", False, traceback.format_exc())
 
     # Test 6: Checkpoint
     if state is not None and mesh is not None:
@@ -476,9 +520,9 @@ def main():
         try:
             test_fsdp(model, params, num_devices)
         except Exception:
-            record("FSDP mode training", False, traceback.format_exc())
+            record("FSDP mode training (bf16)", False, traceback.format_exc())
     else:
-        record("FSDP mode training", False, "Skipped: need >= 2 devices for FSDP")
+        record("FSDP mode training (bf16)", False, "Skipped: need >= 2 devices for FSDP")
 
     _print_summary()
 

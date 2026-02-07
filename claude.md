@@ -943,6 +943,53 @@ float32 2B 模型在 DP 模式下内存使用：
 
 **解决方案**（生产环境）：使用 FSDP 分片 + bfloat16 + gradient checkpointing
 
+---
+
+## bfloat16 训练支持完成记录
+
+**日期**：2026-02-07
+**环境**：v6e-4 spot (us-central1-b)，4 chips，runtime=v2-alpha-tpuv6e
+**JAX**：0.6.2 + libtpu 0.0.17 + flax 0.10.7 + orbax-checkpoint 0.11.15
+**模型**：Qwen/Qwen3-VL-2B-Instruct（2.1B 参数，**bfloat16**）
+
+### 验证结果：8/8 通过
+
+| 测试 | 结果 | 详情 |
+|------|------|------|
+| 1. TPU 设备检测 | ✅ PASS | backend=tpu, 4 chips (topology 2x2) |
+| 2. 模型权重加载 (bf16) | ✅ PASS | 2.1B params, dtype=bfloat16, memory=4.26GB |
+| 3. 前向推理 (bf16) | ✅ PASS | logits=(1,32,151936), dtype=bfloat16, no NaN/Inf |
+| 4. SPMD 分片 (DP) | ✅ PASS | dp=4, fsdp=1, dtype=bfloat16 |
+| 5. 单步训练 (bf16) | ✅ PASS | loss=10.1919, opt_dtype=bfloat16, opt_mem=6.88GB |
+| 6. Checkpoint | ✅ PASS | max_diff=0.0, save+restore 40s, dtype=bfloat16 |
+| 7. 梯度累积 | ✅ PASS | loss=10.1919, accum_steps=2, 54.8s |
+| 8. FSDP 训练 (bf16) | ✅ PASS | loss=10.2434, params sharded across 4 chips |
+
+### 内存对比（float32 vs bfloat16，DP 模式 per chip）
+
+| 项目 | float32 | bfloat16 | 节省 |
+|------|---------|----------|------|
+| 参数 | 8.4GB | 4.2GB | 50% |
+| Adam 优化器状态 | 16.8GB | 6.88GB | 59% |
+| 总计 | ~25GB | ~11GB | 56% |
+| 剩余 HBM (31.25GB/chip) | ~6GB | ~20GB | — |
+
+### 代码修改
+
+1. **`train.py`**：连接 `bf16` 标志到实际 dtype 转换，加载权重后通过 `jax.tree_util.tree_map` 将所有 float 参数从 float32 转为 bfloat16
+2. **`qwen3_vl.py`**：在 VisionModel 调用前，将 `pixel_values` 和 `pixel_values_videos` 转为与 `inputs_embeds` 相同的 dtype（确保 vision encoder 全程 bf16）
+3. **`tpu_validate.py`**：所有测试使用 bf16 参数；修复 `donate_argnums` 导致的 state buffer 复用问题（返回 `new_state` 而非已 donated 的 `state`）
+
+### 混合精度策略
+
+bfloat16 训练中，以下操作保持 float32 以确保数值稳定性（已在 Layer 1 中实现）：
+- `RMSNorm`：variance 计算在 float32，结果 cast 回 bf16
+- `Softmax`（attention 和 loss）：在 float32 中计算
+- `RoPE`：cos/sin 计算在 float32，结果 cast 回 bf16
+- `cross_entropy_loss`：logits 和 log_softmax 在 float32 中计算
+
+---
+
 ### TPU 资源创建关键注意事项
 
 #### 1. TPU Runtime 版本选择（最关键）
