@@ -1,0 +1,27 @@
+# JAX/TPU training dependencies for Qwen3-VL
+# Install JAX with TPU support first:
+#   pip install 'jax[tpu]' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+jax[tpu]>=0.6.0
+flax>=0.10.0
+optax>=0.2.0
+orbax-checkpoint>=0.11.0
+
+transformers>=5.0.0
+accelerate>=1.10.0
+huggingface_hub>=1.0.0
+tokenizers>=0.22.0
+safetensors>=0.7.0
+jinja2>=3.1.0
+
+pillow>=12.0.0
+numpy>=2.0.0
+scipy>=1.15.0
+
+# Vision processing
+qwen-vl-utils>=0.0.14
+torchvision>=0.25.0
+
+# Logging (optional)
+wandb>=0.24.0
+tensorboard>=2.20.0

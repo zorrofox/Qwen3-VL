@@ -544,9 +544,10 @@ class LazySupervisedDataset:
             return new_data_dict
 
 
-def pad_and_cat(tensor_list):
+def pad_and_cat(tensor_list, max_length=None):
     """Pad 3D arrays along axis 2 to max length, then concatenate along axis 1."""
-    max_length = max(arr.shape[2] for arr in tensor_list)
+    if max_length is None:
+        max_length = max(arr.shape[2] for arr in tensor_list)
     padded = []
     for arr in tensor_list:
         pad_width = max_length - arr.shape[2]
@@ -554,7 +555,7 @@ def pad_and_cat(tensor_list):
             padded_arr = np.pad(arr, ((0, 0), (0, 0), (0, pad_width)),
                                 mode='constant', constant_values=1)
         else:
-            padded_arr = arr
+            padded_arr = arr[:, :, :max_length]
         padded.append(padded_arr)
     return np.concatenate(padded, axis=1)
 
@@ -576,6 +577,44 @@ class DataCollatorForSupervisedDataset(object):
 
     tokenizer: transformers.PreTrainedTokenizer
     spatial_merge_size: int = 2
+    max_total_patches: int = 0    # 0 = no padding (backward compatible)
+    max_num_images: int = 0       # 0 = no padding
+    model_max_length: int = 0     # 0 = use batch max (no fixed padding)
+
+    def _pad_vision_inputs(self, pixel_values, grid_thw, pos_ids_2d, pos_ids_1d, cu_seqlens):
+        """Pad vision tensors to fixed shapes to avoid JIT recompilation."""
+        if self.max_total_patches <= 0:
+            return pixel_values, grid_thw, pos_ids_2d, pos_ids_1d, cu_seqlens
+
+        actual_N = pixel_values.shape[0]
+        pad_N = self.max_total_patches - actual_N
+        if pad_N < 0:
+            raise ValueError(f"Actual patches {actual_N} > max {self.max_total_patches}")
+
+        # 1. Pad pixel_values: (actual_N, ...) -> (max_N, ...)
+        if pad_N > 0:
+            pixel_values = np.pad(pixel_values,
+                [(0, pad_N)] + [(0, 0)] * (pixel_values.ndim - 1))
+
+        # 2. Pad position IDs
+        pos_ids_2d = np.pad(pos_ids_2d, [(0, pad_N), (0, 0)])
+        pos_ids_1d = np.pad(pos_ids_1d, [(0, pad_N)])
+
+        # 3. Pad cu_seqlens: add padding segment + pad to fixed length
+        if cu_seqlens[-1] < self.max_total_patches:
+            cu_seqlens = np.append(cu_seqlens, self.max_total_patches)
+        max_cu_len = self.max_num_images + 2
+        if len(cu_seqlens) < max_cu_len:
+            cu_seqlens = np.pad(cu_seqlens,
+                (0, max_cu_len - len(cu_seqlens)),
+                constant_values=self.max_total_patches)
+
+        # 4. Pad grid_thw: (actual_imgs, 3) -> (max_num_images, 3)
+        if grid_thw.shape[0] < self.max_num_images:
+            pad_grid = np.zeros((self.max_num_images - grid_thw.shape[0], 3), dtype=grid_thw.dtype)
+            grid_thw = np.concatenate([grid_thw, pad_grid])
+
+        return pixel_values, grid_thw, pos_ids_2d, pos_ids_1d, cu_seqlens
 
     def __call__(self, instances: Sequence[Dict]) -> Batch:
         input_ids, labels, position_ids = tuple(
@@ -584,16 +623,14 @@ class DataCollatorForSupervisedDataset(object):
         )
         input_ids = [ids.squeeze(0) if ids.ndim > 1 else ids for ids in input_ids]
         labels = [ids.squeeze(0) if ids.ndim > 1 else ids for ids in labels]
+        max_len = self.model_max_length if self.model_max_length > 0 else None
         input_ids = _pad_sequence(
-            input_ids, padding_value=self.tokenizer.pad_token_id
+            input_ids, padding_value=self.tokenizer.pad_token_id, max_length=max_len
         )
         labels = _pad_sequence(
-            labels, padding_value=IGNORE_INDEX
+            labels, padding_value=IGNORE_INDEX, max_length=max_len
         )
-        position_ids = pad_and_cat(position_ids)
-        input_ids = input_ids[:, : self.tokenizer.model_max_length]
-        labels = labels[:, : self.tokenizer.model_max_length]
-        position_ids = position_ids[:, :, : self.tokenizer.model_max_length]
+        position_ids = pad_and_cat(position_ids, max_length=max_len)
         attention_mask = (input_ids != self.tokenizer.pad_token_id)
 
         images = list(
@@ -622,6 +659,9 @@ class DataCollatorForSupervisedDataset(object):
                 grid_thw, self.spatial_merge_size
             )
             image_cu_seqlens = precompute_vision_cu_seqlens(grid_thw)
+            # Pad vision tensors to fixed shapes to avoid XLA recompilation
+            concat_images, grid_thw, image_pos_ids_2d, image_pos_ids_1d, image_cu_seqlens = \
+                self._pad_vision_inputs(concat_images, grid_thw, image_pos_ids_2d, image_pos_ids_1d, image_cu_seqlens)
         else:
             concat_images = None
             grid_thw = None
@@ -669,6 +709,44 @@ class FlattenedDataCollatorForSupervisedDataset(object):
 
     tokenizer: transformers.PreTrainedTokenizer
     spatial_merge_size: int = 2
+    max_total_patches: int = 0
+    max_num_images: int = 0
+    model_max_length: int = 0
+
+    def _pad_vision_inputs(self, pixel_values, grid_thw, pos_ids_2d, pos_ids_1d, cu_seqlens):
+        """Pad vision tensors to fixed shapes to avoid JIT recompilation."""
+        if self.max_total_patches <= 0:
+            return pixel_values, grid_thw, pos_ids_2d, pos_ids_1d, cu_seqlens
+
+        actual_N = pixel_values.shape[0]
+        pad_N = self.max_total_patches - actual_N
+        if pad_N < 0:
+            raise ValueError(f"Actual patches {actual_N} > max {self.max_total_patches}")
+
+        # 1. Pad pixel_values: (actual_N, ...) -> (max_N, ...)
+        if pad_N > 0:
+            pixel_values = np.pad(pixel_values,
+                [(0, pad_N)] + [(0, 0)] * (pixel_values.ndim - 1))
+
+        # 2. Pad position IDs
+        pos_ids_2d = np.pad(pos_ids_2d, [(0, pad_N), (0, 0)])
+        pos_ids_1d = np.pad(pos_ids_1d, [(0, pad_N)])
+
+        # 3. Pad cu_seqlens: add padding segment + pad to fixed length
+        if cu_seqlens[-1] < self.max_total_patches:
+            cu_seqlens = np.append(cu_seqlens, self.max_total_patches)
+        max_cu_len = self.max_num_images + 2
+        if len(cu_seqlens) < max_cu_len:
+            cu_seqlens = np.pad(cu_seqlens,
+                (0, max_cu_len - len(cu_seqlens)),
+                constant_values=self.max_total_patches)
+
+        # 4. Pad grid_thw: (actual_imgs, 3) -> (max_num_images, 3)
+        if grid_thw.shape[0] < self.max_num_images:
+            pad_grid = np.zeros((self.max_num_images - grid_thw.shape[0], 3), dtype=grid_thw.dtype)
+            grid_thw = np.concatenate([grid_thw, pad_grid])
+
+        return pixel_values, grid_thw, pos_ids_2d, pos_ids_1d, cu_seqlens
 
     def __call__(self, instances: Sequence[Dict]) -> Batch:
         input_ids, labels, position_ids, attention_mask = tuple(
@@ -715,6 +793,9 @@ class FlattenedDataCollatorForSupervisedDataset(object):
                 grid_thw, self.spatial_merge_size
             )
             image_cu_seqlens = precompute_vision_cu_seqlens(grid_thw)
+            # Pad vision tensors to fixed shapes to avoid XLA recompilation
+            concat_images, grid_thw, image_pos_ids_2d, image_pos_ids_1d, image_cu_seqlens = \
+                self._pad_vision_inputs(concat_images, grid_thw, image_pos_ids_2d, image_pos_ids_1d, image_cu_seqlens)
         else:
             concat_images = None
             grid_thw = None
