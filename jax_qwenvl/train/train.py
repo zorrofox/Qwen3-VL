@@ -33,6 +33,7 @@ from jax_qwenvl.train.optimizer import create_schedule
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
@@ -183,11 +184,15 @@ def _make_args(parser: argparse.ArgumentParser):
 # ---------------------------------------------------------------------------
 
 def _batch_indices(dataset_size: int, batch_size: int, seed: int, epoch: int):
-    """Yield lists of indices for each batch in one epoch."""
+    """Yield lists of indices for each batch in one epoch.
+
+    Drops the last batch if it has fewer than ``batch_size`` samples
+    (required for DP sharding which needs axis 0 divisible by num_devices).
+    """
     rng = np.random.RandomState(seed + epoch)
     indices = rng.permutation(dataset_size)
-    for start in range(0, dataset_size, batch_size):
-        end = min(start + batch_size, dataset_size)
+    for start in range(0, dataset_size - batch_size + 1, batch_size):
+        end = start + batch_size
         yield indices[start:end].tolist()
 
 
@@ -236,10 +241,14 @@ def main():
     logger.info("Model: %s", model_args.model_name_or_path)
 
     # 2. Load config
+    logger.info("Loading config ...")
     config = Qwen3VLConfig.from_pretrained(model_args.model_name_or_path)
+    logger.info("Config loaded.")
 
     # 3. Load processor/tokenizer
+    logger.info("Loading processor/tokenizer ...")
     processor = AutoProcessor.from_pretrained(model_args.model_name_or_path)
+    logger.info("Processor loaded.")
 
     # 4. Create device mesh
     if training_args.fsdp:
@@ -261,11 +270,14 @@ def main():
     )
 
     # 6. Load weights from HuggingFace safetensors
+    import time as _time
+    _t0 = _time.time()
     logger.info("Loading weights from %s ...", model_args.model_name_or_path)
     loaded = load_hf_weights(
         model_args.model_name_or_path, config, lora_rank=lora_rank
     )
     params = loaded["params"]
+    logger.info("Weights loaded in %.1fs", _time.time() - _t0)
 
     # Cast to bfloat16 if requested (halves memory for params + optimizer)
     param_dtype = jnp.bfloat16 if training_args.bf16 else jnp.float32
@@ -290,16 +302,21 @@ def main():
         params = _merge_params(params, init_params)
 
     # 8. Shard params onto device mesh
+    _t0 = _time.time()
+    logger.info("Sharding parameters ...")
     with mesh:
         rules = get_param_sharding_rules(sharding_mode)
         params = shard_params(params, mesh, rules)
-    logger.info("Parameters sharded with mode=%s", sharding_mode)
+    logger.info("Parameters sharded with mode=%s in %.1fs", sharding_mode, _time.time() - _t0)
 
     # 9. Create dataset and compute total steps
     dataset_configs = data_list(data_args.dataset_use.split(","))
     logger.info("Datasets: %s", dataset_configs)
 
+    _t0 = _time.time()
+    logger.info("Loading dataset ...")
     dataset = LazySupervisedDataset(processor, data_args=data_args)
+    logger.info("Dataset loaded (%d samples) in %.1fs", len(dataset), _time.time() - _t0)
     if data_args.data_flatten or data_args.data_packing:
         from jax_qwenvl.data.data_processor import FlattenedDataCollatorForSupervisedDataset
         merge_size = getattr(processor.image_processor, "merge_size", 2)
@@ -317,12 +334,15 @@ def main():
         )
 
     dataset_size = len(dataset)
-    batch_size = training_args.per_device_train_batch_size
+    num_dp_devices = mesh.shape['dp']
+    batch_size = training_args.per_device_train_batch_size * num_dp_devices
     steps_per_epoch = max(dataset_size // batch_size, 1)
     total_steps = steps_per_epoch * training_args.num_train_epochs
     logger.info(
-        "Dataset size=%d, batch_size=%d, steps_per_epoch=%d, total_steps=%d",
-        dataset_size, batch_size, steps_per_epoch, total_steps,
+        "Dataset size=%d, per_device_batch=%d, num_dp_devices=%d, "
+        "global_batch=%d, steps_per_epoch=%d, total_steps=%d",
+        dataset_size, training_args.per_device_train_batch_size,
+        num_dp_devices, batch_size, steps_per_epoch, total_steps,
     )
 
     # Compute warmup steps from ratio if needed
@@ -381,7 +401,7 @@ def main():
             state = restored
             logger.info("Resumed from step %s", ckpt_manager.latest_step())
 
-    logger.info("Starting training ...")
+    logger.info("Starting training (first step includes XLA compilation) ...")
 
     # 13. Training loop
     global_step = 0
