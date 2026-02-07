@@ -1,0 +1,102 @@
+#!/bin/bash
+# TPU training launch script for JAX Qwen3-VL fine-tuning.
+#
+# Usage:
+#   bash jax_qwenvl/scripts/train_tpu.sh
+#
+# Environment variables (override defaults):
+#   MODEL_PATH    - HuggingFace model path (default: Qwen/Qwen3-VL-2B-Instruct)
+#   DATASETS      - Comma-separated dataset names (default: cambrian_737k)
+#   OUTPUT_DIR    - Output directory (default: ./output)
+#   BATCH_SIZE    - Per-device train batch size (default: 4)
+#   GRAD_ACCUM    - Gradient accumulation steps (default: 4)
+#   LR            - Learning rate (default: 2e-7)
+#   NUM_EPOCHS    - Number of training epochs (default: 1)
+#   REPORT_TO     - Logging backend: none, wandb, tensorboard (default: none)
+#   RUN_NAME      - Run name for logging (default: qwen3vl-jax)
+
+set -euo pipefail
+
+# Model configuration
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-2B-Instruct}"
+DATASETS="${DATASETS:-cambrian_737k}"
+OUTPUT_DIR="${OUTPUT_DIR:-./output}"
+
+# Training hyperparameters
+BATCH_SIZE="${BATCH_SIZE:-4}"
+GRAD_ACCUM="${GRAD_ACCUM:-4}"
+LR="${LR:-2e-7}"
+NUM_EPOCHS="${NUM_EPOCHS:-1}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
+
+# Module tuning flags
+TUNE_VISION="${TUNE_VISION:-False}"
+TUNE_MLP="${TUNE_MLP:-True}"
+TUNE_LLM="${TUNE_LLM:-True}"
+
+# Image/video resolution
+MAX_PIXELS="${MAX_PIXELS:-50176}"
+MIN_PIXELS="${MIN_PIXELS:-784}"
+
+# Data settings
+DATA_FLATTEN="${DATA_FLATTEN:-True}"
+MODEL_MAX_LENGTH="${MODEL_MAX_LENGTH:-8192}"
+
+# Logging
+REPORT_TO="${REPORT_TO:-none}"
+RUN_NAME="${RUN_NAME:-qwen3vl-jax}"
+
+# Checkpointing
+SAVE_STEPS="${SAVE_STEPS:-1000}"
+MAX_CHECKPOINTS="${MAX_CHECKPOINTS:-3}"
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-True}"
+
+# FSDP (set to True for multi-device FSDP)
+FSDP="${FSDP:-False}"
+
+# LoRA
+LORA_ENABLE="${LORA_ENABLE:-False}"
+LORA_RANK="${LORA_RANK:-64}"
+LORA_ALPHA="${LORA_ALPHA:-128}"
+
+echo "=== JAX Qwen3-VL Training ==="
+echo "Model:      ${MODEL_PATH}"
+echo "Datasets:   ${DATASETS}"
+echo "Output:     ${OUTPUT_DIR}"
+echo "Batch size: ${BATCH_SIZE} (accum: ${GRAD_ACCUM})"
+echo "LR:         ${LR}"
+echo "Devices:    $(python3 -c 'import jax; print(len(jax.devices()))' 2>/dev/null || echo 'unknown')"
+echo "=============================="
+
+python3 -m jax_qwenvl.train.train \
+    --model_name_or_path "${MODEL_PATH}" \
+    --dataset_use "${DATASETS}" \
+    --output_dir "${OUTPUT_DIR}" \
+    --per_device_train_batch_size "${BATCH_SIZE}" \
+    --gradient_accumulation_steps "${GRAD_ACCUM}" \
+    --learning_rate "${LR}" \
+    --num_train_epochs "${NUM_EPOCHS}" \
+    --warmup_ratio "${WARMUP_RATIO}" \
+    --weight_decay "${WEIGHT_DECAY}" \
+    --max_grad_norm "${MAX_GRAD_NORM}" \
+    --tune_mm_vision "${TUNE_VISION}" \
+    --tune_mm_mlp "${TUNE_MLP}" \
+    --tune_mm_llm "${TUNE_LLM}" \
+    --max_pixels "${MAX_PIXELS}" \
+    --min_pixels "${MIN_PIXELS}" \
+    --data_flatten "${DATA_FLATTEN}" \
+    --model_max_length "${MODEL_MAX_LENGTH}" \
+    --report_to "${REPORT_TO}" \
+    --run_name "${RUN_NAME}" \
+    --save_steps "${SAVE_STEPS}" \
+    --max_checkpoints "${MAX_CHECKPOINTS}" \
+    --gradient_checkpointing "${GRADIENT_CHECKPOINTING}" \
+    --fsdp "${FSDP}" \
+    --lora_enable "${LORA_ENABLE}" \
+    --lora_rank "${LORA_RANK}" \
+    --lora_alpha "${LORA_ALPHA}" \
+    --bf16 True \
+    --logging_steps 1 \
+    --seed 42
