@@ -37,6 +37,14 @@ DEMO_IMAGES = {
     "data_path": os.path.join(_REPO_ROOT, "qwen-vl-finetune"),
 }
 
+# LLaVA-Instruct-150K: 150K GPT-generated multimodal instruction-following data
+# Images from COCO train2017. Download with: bash jax_qwenvl/scripts/download_llava_data.sh
+_LLAVA_DATA_ROOT = os.environ.get("LLAVA_DATA_ROOT", "/data/llava")
+LLAVA_INSTRUCT_150K = {
+    "annotation_path": os.path.join(_LLAVA_DATA_ROOT, "llava_instruct_150k.json"),
+    "data_path": os.path.join(_LLAVA_DATA_ROOT, "train2017"),
+}
+
 data_dict = {
     "cambrian_737k": CAMBRIAN_737K,
     "cambrian_737k_pack": CAMBRIAN_737K_PACK,
@@ -44,6 +52,7 @@ data_dict = {
     "clevr_mc": CLEVR_MC,
     "videochatgpt": VIDEOCHATGPT,
     "demo_images": DEMO_IMAGES,
+    "llava_instruct_150k": LLAVA_INSTRUCT_150K,
 }
 
 
