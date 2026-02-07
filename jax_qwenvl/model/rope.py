@@ -71,14 +71,14 @@ def compute_vision_rotary_cos_sin(
     """
     rotary_dim = head_dim // 2  # dim passed to VisionRotaryEmbedding
 
-    # Build frequency table: (max_pos, rotary_dim // 2)
-    max_pos = int(pos_ids_2d.max()) + 1
-    freq_table = vision_rotary_freq_table(max_pos, rotary_dim, theta)
-    # freq_table: (max_pos, rotary_dim // 2) = (max_pos, head_dim // 4)
+    # Compute frequencies directly (JIT-compatible, no table lookup)
+    half_dim = rotary_dim // 2  # = head_dim // 4
+    inv_freq = 1.0 / (
+        theta ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim)
+    )  # (half_dim,)
 
-    # Look up: pos_ids_2d has shape (total_tokens, 2)
-    # freq_table[pos_ids_2d] -> (total_tokens, 2, head_dim // 4)
-    embeddings = freq_table[pos_ids_2d]  # (total_tokens, 2, head_dim // 4)
+    # pos_ids_2d: (total_tokens, 2) -> (total_tokens, 2, half_dim)
+    embeddings = pos_ids_2d[:, :, None].astype(jnp.float32) * inv_freq[None, None, :]
     # Flatten: (total_tokens, head_dim // 2)
     embeddings = embeddings.reshape(embeddings.shape[0], -1)
     # Double: (total_tokens, head_dim)

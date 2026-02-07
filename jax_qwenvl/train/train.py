@@ -302,11 +302,19 @@ def main():
     dataset = LazySupervisedDataset(processor, data_args=data_args)
     if data_args.data_flatten or data_args.data_packing:
         from jax_qwenvl.data.data_processor import FlattenedDataCollatorForSupervisedDataset
-        collator = FlattenedDataCollatorForSupervisedDataset(tokenizer=processor.tokenizer)
+        merge_size = getattr(processor.image_processor, "merge_size", 2)
+        collator = FlattenedDataCollatorForSupervisedDataset(
+            tokenizer=processor.tokenizer,
+            spatial_merge_size=merge_size,
+        )
         logger.info("Using FlattenedDataCollator (data_flatten=%s, data_packing=%s)",
                      data_args.data_flatten, data_args.data_packing)
     else:
-        collator = DataCollatorForSupervisedDataset(tokenizer=processor.tokenizer)
+        merge_size = getattr(processor.image_processor, "merge_size", 2)
+        collator = DataCollatorForSupervisedDataset(
+            tokenizer=processor.tokenizer,
+            spatial_merge_size=merge_size,
+        )
 
     dataset_size = len(dataset)
     batch_size = training_args.per_device_train_batch_size
@@ -401,28 +409,42 @@ def main():
                         # Stack micro-batches: each field gets leading dim of accum_steps
                         stacked = _stack_micro_batches(micro_batch_buffer)
                         stacked = shard_batch(stacked, mesh)
+
+                        # Compute token count before train_step (batch may be donated)
+                        total_tokens = int(stacked.attention_mask.sum())
+
+                        step_t0 = time.time()
                         state, metrics = train_step_with_accumulation(
                             state, stacked, accum_steps
                         )
+                        jax.block_until_ready(metrics["loss"])
+                        step_elapsed = time.time() - step_t0
+
                         micro_batch_buffer = []
 
                         loss_val = float(metrics["loss"])
                         epoch_loss += loss_val
                         epoch_steps += 1
                         global_step += 1
+                        tokens_per_sec = total_tokens / max(step_elapsed, 1e-6)
 
                         if global_step % training_args.logging_steps == 0:
                             avg_loss = epoch_loss / max(epoch_steps, 1)
                             elapsed = time.time() - t0
                             logger.info(
-                                "Epoch %d | Step %d (global %d) | loss=%.4f | avg_loss=%.4f | %.1fs",
-                                epoch, epoch_steps, global_step, loss_val, avg_loss, elapsed,
+                                "Epoch %d | Step %d (global %d) | loss=%.4f | avg_loss=%.4f "
+                                "| step_time=%.2fs | tokens/s=%.0f | %.1fs",
+                                epoch, epoch_steps, global_step, loss_val, avg_loss,
+                                step_elapsed, tokens_per_sec, elapsed,
                             )
                             metrics_logger.log({
                                 "train/loss": loss_val,
                                 "train/avg_loss": avg_loss,
                                 "train/epoch": epoch,
                                 "train/global_step": global_step,
+                                "train/step_time": step_elapsed,
+                                "train/tokens_per_sec": tokens_per_sec,
+                                "train/steps_per_sec": 1.0 / max(step_elapsed, 1e-6),
                                 "train/learning_rate": float(
                                     create_schedule(
                                         training_args.learning_rate, warmup_steps, total_steps
@@ -438,24 +460,37 @@ def main():
                     batch = collator(samples)
                     batch = shard_batch(batch, mesh)
 
+                    # Compute token count before train_step (batch may be donated)
+                    total_tokens = int(batch.attention_mask.sum())
+
+                    step_t0 = time.time()
                     state, metrics = train_step(state, batch)
+                    jax.block_until_ready(metrics["loss"])
+                    step_elapsed = time.time() - step_t0
+
                     loss_val = float(metrics["loss"])
                     epoch_loss += loss_val
                     epoch_steps += 1
                     global_step += 1
+                    tokens_per_sec = total_tokens / max(step_elapsed, 1e-6)
 
                     if global_step % training_args.logging_steps == 0:
                         avg_loss = epoch_loss / max(epoch_steps, 1)
                         elapsed = time.time() - t0
                         logger.info(
-                            "Epoch %d | Step %d (global %d) | loss=%.4f | avg_loss=%.4f | %.1fs",
-                            epoch, epoch_steps, global_step, loss_val, avg_loss, elapsed,
+                            "Epoch %d | Step %d (global %d) | loss=%.4f | avg_loss=%.4f "
+                            "| step_time=%.2fs | tokens/s=%.0f | %.1fs",
+                            epoch, epoch_steps, global_step, loss_val, avg_loss,
+                            step_elapsed, tokens_per_sec, elapsed,
                         )
                         metrics_logger.log({
                             "train/loss": loss_val,
                             "train/avg_loss": avg_loss,
                             "train/epoch": epoch,
                             "train/global_step": global_step,
+                            "train/step_time": step_elapsed,
+                            "train/tokens_per_sec": tokens_per_sec,
+                            "train/steps_per_sec": 1.0 / max(step_elapsed, 1e-6),
                             "train/learning_rate": float(
                                 create_schedule(
                                     training_args.learning_rate, warmup_steps, total_steps

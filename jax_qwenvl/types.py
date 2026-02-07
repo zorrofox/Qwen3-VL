@@ -21,6 +21,13 @@ class Batch(NamedTuple):
     image_grid_thw: Optional[np.ndarray] = None  # (num_images, 3), int32
     pixel_values_videos: Optional[np.ndarray] = None  # (N, C, H, W), float32 -- video frames
     video_grid_thw: Optional[np.ndarray] = None  # (num_videos, 3), int32
+    # Precomputed vision position IDs (host-side, outside JIT)
+    image_pos_ids_2d: Optional[np.ndarray] = None  # (total_img_tokens, 2), int32
+    image_pos_ids_1d: Optional[np.ndarray] = None  # (total_img_tokens,), int32
+    image_cu_seqlens: Optional[np.ndarray] = None  # (num_img_segments + 1,), int32
+    video_pos_ids_2d: Optional[np.ndarray] = None  # (total_vid_tokens, 2), int32
+    video_pos_ids_1d: Optional[np.ndarray] = None  # (total_vid_tokens,), int32
+    video_cu_seqlens: Optional[np.ndarray] = None  # (num_vid_segments + 1,), int32
 
 
 class CausalLMOutput(NamedTuple):

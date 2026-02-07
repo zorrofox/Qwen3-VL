@@ -160,6 +160,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         pixel_values_videos: Optional[jnp.ndarray] = None,
         video_grid_thw: Optional[jnp.ndarray] = None,
         labels: Optional[jnp.ndarray] = None,
+        image_pos_ids_2d: Optional[jnp.ndarray] = None,
+        image_pos_ids_1d: Optional[jnp.ndarray] = None,
+        image_cu_seqlens: Optional[jnp.ndarray] = None,
+        video_pos_ids_2d: Optional[jnp.ndarray] = None,
+        video_pos_ids_1d: Optional[jnp.ndarray] = None,
+        video_cu_seqlens: Optional[jnp.ndarray] = None,
     ):
         """Forward pass.
 
@@ -202,7 +208,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 config=cfg.vision_config,
                 gradient_checkpointing=self.gradient_checkpointing,
                 name="visual",
-            )(pixel_values, image_grid_thw)
+            )(pixel_values, image_grid_thw,
+              pos_ids_2d=image_pos_ids_2d,
+              pos_ids_1d=image_pos_ids_1d,
+              cu_seqlens=image_cu_seqlens)
             # image_embeds: (num_merged_tokens, out_hidden_size)
 
             # Mask: where input_ids == image_token_id
@@ -219,7 +228,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 config=cfg.vision_config,
                 gradient_checkpointing=self.gradient_checkpointing,
                 name="visual",
-            )(pixel_values_videos, video_grid_thw)
+            )(pixel_values_videos, video_grid_thw,
+              pos_ids_2d=video_pos_ids_2d,
+              pos_ids_1d=video_pos_ids_1d,
+              cu_seqlens=video_cu_seqlens)
 
             video_mask = (input_ids == cfg.video_token_id)  # (B, L) bool
             inputs_embeds = _scatter_embeddings(

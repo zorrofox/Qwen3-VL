@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -19,6 +20,102 @@ import flax.linen as nn
 from .config import Qwen3VLVisionConfig
 from .layers import VisionMLP
 from .rope import compute_vision_rotary_cos_sin, apply_rotary_pos_emb_vision
+
+
+# ---------------------------------------------------------------------------
+# Host-side precomputation (numpy, called BEFORE JIT)
+# ---------------------------------------------------------------------------
+
+def precompute_vision_position_ids(
+    grid_thw: np.ndarray,
+    spatial_merge_size: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute vision position IDs on the host (numpy, outside JIT).
+
+    Args:
+        grid_thw: ``(num_entries, 3)`` int array of (T, H, W) per image/video.
+        spatial_merge_size: merge factor (typically 2).
+
+    Returns:
+        ``(pos_ids_2d, pos_ids_1d)`` where:
+        - ``pos_ids_2d``: ``(total_tokens, 2)`` int32 -- (row, col) for rotary.
+        - ``pos_ids_1d``: ``(total_tokens,)`` int32 -- for learned position embed.
+    """
+    merge = spatial_merge_size
+    all_2d = []
+    all_1d = []
+
+    for idx in range(grid_thw.shape[0]):
+        t = int(grid_thw[idx, 0])
+        h = int(grid_thw[idx, 1])
+        w = int(grid_thw[idx, 2])
+
+        merged_h = h // merge
+        merged_w = w // merge
+
+        block_rows = np.arange(merged_h, dtype=np.int32)
+        block_cols = np.arange(merged_w, dtype=np.int32)
+        intra_row = np.arange(merge, dtype=np.int32)
+        intra_col = np.arange(merge, dtype=np.int32)
+
+        row_idx = (
+            block_rows[:, None, None, None] * merge
+            + intra_row[None, None, :, None]
+        )
+        col_idx = (
+            block_cols[None, :, None, None] * merge
+            + intra_col[None, None, None, :]
+        )
+
+        row_idx = np.broadcast_to(
+            row_idx, (merged_h, merged_w, merge, merge)
+        ).reshape(-1)
+        col_idx = np.broadcast_to(
+            col_idx, (merged_h, merged_w, merge, merge)
+        ).reshape(-1)
+
+        coords = np.stack([row_idx, col_idx], axis=-1)  # (h*w, 2)
+        if t > 1:
+            coords = np.tile(coords, (t, 1))
+        all_2d.append(coords)
+
+        pos_1d = row_idx * w + col_idx
+        if t > 1:
+            pos_1d = np.tile(pos_1d, t)
+        all_1d.append(pos_1d)
+
+    if len(all_2d) == 0:
+        return np.zeros((0, 2), dtype=np.int32), np.zeros(0, dtype=np.int32)
+    return (
+        np.concatenate(all_2d, axis=0).astype(np.int32),
+        np.concatenate(all_1d, axis=0).astype(np.int32),
+    )
+
+
+def precompute_vision_cu_seqlens(grid_thw: np.ndarray) -> np.ndarray:
+    """Compute cumulative sequence lengths on the host (numpy, outside JIT).
+
+    Args:
+        grid_thw: ``(num_entries, 3)`` int array of (T, H, W) per image/video.
+
+    Returns:
+        ``(num_segments + 1,)`` int32 with ``cu_seqlens[0] == 0``.
+    """
+    all_lens = []
+    for idx in range(grid_thw.shape[0]):
+        t = int(grid_thw[idx, 0])
+        h = int(grid_thw[idx, 1])
+        w = int(grid_thw[idx, 2])
+        frame_len = h * w
+        for _ in range(t):
+            all_lens.append(frame_len)
+
+    if len(all_lens) == 0:
+        return np.array([0], dtype=np.int32)
+
+    lens = np.array(all_lens, dtype=np.int32)
+    cu = np.concatenate([np.array([0], dtype=np.int32), np.cumsum(lens)])
+    return cu.astype(np.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +361,9 @@ class VisionModel(nn.Module):
         self,
         hidden_states: jnp.ndarray,
         grid_thw: jnp.ndarray,
+        pos_ids_2d: Optional[jnp.ndarray] = None,
+        pos_ids_1d: Optional[jnp.ndarray] = None,
+        cu_seqlens: Optional[jnp.ndarray] = None,
     ) -> Tuple[jnp.ndarray, List[jnp.ndarray]]:
         cfg = self.config
 
@@ -271,8 +371,11 @@ class VisionModel(nn.Module):
         hidden_states = PatchEmbed3D(config=cfg, name="patch_embed")(hidden_states)
         # hidden_states: (total_patches, hidden_size)
 
-        # 2. Compute 2-D position indices (row, col) for learned + rotary embeddings
-        pos_ids_2d, pos_ids_1d = self._compute_position_ids(grid_thw, cfg)
+        # 2. Use precomputed position IDs (must be computed on host before JIT)
+        assert pos_ids_2d is not None and pos_ids_1d is not None, (
+            "pos_ids_2d and pos_ids_1d must be precomputed on host and passed in. "
+            "Use precompute_vision_position_ids(grid_thw, spatial_merge_size)."
+        )
 
         # 3. Learned position embedding
         pos_embed = nn.Embed(
@@ -287,8 +390,11 @@ class VisionModel(nn.Module):
             pos_ids_2d, cfg.head_dim, theta=cfg.rope_theta
         )
 
-        # 5. Compute cu_seqlens from grid_thw
-        cu_seqlens = self._compute_cu_seqlens(grid_thw)
+        # 5. Use precomputed cu_seqlens
+        assert cu_seqlens is not None, (
+            "cu_seqlens must be precomputed on host and passed in. "
+            "Use precompute_vision_cu_seqlens(grid_thw)."
+        )
 
         # 6. Transformer blocks with DeepStack feature extraction
         deepstack_features: List[jnp.ndarray] = []
@@ -312,10 +418,7 @@ class VisionModel(nn.Module):
                 deepstack_features.append(ds_merged)
                 deepstack_idx += 1
 
-        # 7. Final layer norm
-        hidden_states = nn.LayerNorm(epsilon=1e-6, name="ln_post")(hidden_states)
-
-        # 8. Final patch merger
+        # 7. Final patch merger (Qwen3-VL has no ln_post before merger)
         merged_output = PatchMerger(
             config=cfg,
             use_postshuffle_norm=False,

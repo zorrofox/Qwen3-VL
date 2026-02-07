@@ -1,6 +1,10 @@
 """Dataset registry for JAX Qwen-VL fine-tuning."""
 
+import os
 import re
+
+_DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_DATA_DIR, "..", ".."))
 
 # Define placeholders for dataset paths
 CAMBRIAN_737K = {
@@ -28,12 +32,18 @@ VIDEOCHATGPT = {
     "data_path": "PATH_TO_VIDEOCHATGPT_DATA",
 }
 
+DEMO_IMAGES = {
+    "annotation_path": os.path.join(_REPO_ROOT, "qwen-vl-finetune", "demo", "single_images.json"),
+    "data_path": os.path.join(_REPO_ROOT, "qwen-vl-finetune"),
+}
+
 data_dict = {
     "cambrian_737k": CAMBRIAN_737K,
     "cambrian_737k_pack": CAMBRIAN_737K_PACK,
     "mp_doc": MP_DOC,
     "clevr_mc": CLEVR_MC,
     "videochatgpt": VIDEOCHATGPT,
+    "demo_images": DEMO_IMAGES,
 }
 
 
