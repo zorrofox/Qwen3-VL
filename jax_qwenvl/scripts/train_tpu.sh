@@ -14,6 +14,7 @@
 #   NUM_EPOCHS    - Number of training epochs (default: 1)
 #   REPORT_TO     - Logging backend: none, wandb, tensorboard (default: none)
 #   RUN_NAME      - Run name for logging (default: qwen3vl-jax)
+#   LOGGING_DIR   - Tensorboard log directory, supports gs:// paths (default: output_dir)
 
 set -euo pipefail
 
@@ -47,6 +48,7 @@ MODEL_MAX_LENGTH="${MODEL_MAX_LENGTH:-8192}"
 # Logging
 REPORT_TO="${REPORT_TO:-none}"
 RUN_NAME="${RUN_NAME:-qwen3vl-jax}"
+LOGGING_DIR="${LOGGING_DIR:-}"
 
 # Checkpointing
 SAVE_STEPS="${SAVE_STEPS:-1000}"
@@ -69,6 +71,11 @@ echo "Batch size: ${BATCH_SIZE} (accum: ${GRAD_ACCUM})"
 echo "LR:         ${LR}"
 echo "Devices:    $(python3 -c 'import jax; print(len(jax.devices()))' 2>/dev/null || echo 'unknown')"
 echo "=============================="
+
+EXTRA_ARGS=()
+if [ -n "${LOGGING_DIR}" ]; then
+    EXTRA_ARGS+=(--logging_dir "${LOGGING_DIR}")
+fi
 
 python3 -m jax_qwenvl.train.train \
     --model_name_or_path "${MODEL_PATH}" \
@@ -99,4 +106,5 @@ python3 -m jax_qwenvl.train.train \
     --lora_alpha "${LORA_ALPHA}" \
     --bf16 True \
     --logging_steps 1 \
-    --seed 42
+    --seed 42 \
+    "${EXTRA_ARGS[@]}"
