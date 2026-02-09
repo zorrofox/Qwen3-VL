@@ -93,6 +93,7 @@ class TrainingArguments:
     run_name: str = ""
     warmup_ratio: float = 0.0
     logging_dir: Optional[str] = None  # tensorboard log dir (supports GCS paths); defaults to output_dir
+    gcs_output_dir: Optional[str] = None  # GCS path for model/checkpoint upload (e.g. gs://bucket/path)
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +224,37 @@ def _stack_micro_batches(micro_batches):
         stacked_values.append(_stack_field(name, field_vals))
 
     return Batch(*stacked_values)
+
+
+# ---------------------------------------------------------------------------
+# GCS upload helper
+# ---------------------------------------------------------------------------
+
+def _upload_to_gcs(local_dir: str, gcs_dir: str):
+    """Upload model files (safetensors, json, jinja) from local_dir to GCS.
+
+    Skips checkpoint subdirectories (which are synced separately).
+    """
+    import subprocess
+
+    gcs_dir = gcs_dir.rstrip("/") + "/"
+    uploaded = 0
+    for fname in os.listdir(local_dir):
+        fpath = os.path.join(local_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        if not fname.endswith((".safetensors", ".json", ".jinja")):
+            continue
+        dst = gcs_dir + fname
+        try:
+            subprocess.run(
+                ["gcloud", "storage", "cp", fpath, dst],
+                check=True, capture_output=True, text=True,
+            )
+            uploaded += 1
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logger.warning("Failed to upload %s to GCS: %s", fname, e)
+    logger.info("Model uploaded to %s (%d files)", gcs_dir, uploaded)
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +473,7 @@ def main():
         output_dir=training_args.output_dir,
         max_to_keep=training_args.max_checkpoints,
         save_interval_steps=training_args.save_steps,
+        gcs_dir=training_args.gcs_output_dir,
     )
 
     # Resume from checkpoint if requested
@@ -594,6 +627,10 @@ def main():
             # Save processor/tokenizer
             processor.save_pretrained(training_args.output_dir)
             logger.info("Processor saved to %s", training_args.output_dir)
+
+            # Upload model files to GCS
+            if training_args.gcs_output_dir:
+                _upload_to_gcs(training_args.output_dir, training_args.gcs_output_dir)
 
     metrics_logger.finish()
     logger.info("Training complete. Output dir: %s", training_args.output_dir)

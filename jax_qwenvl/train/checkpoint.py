@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
+import jax
 import orbax.checkpoint as ocp
 
 logger = logging.getLogger(__name__)
@@ -22,13 +24,16 @@ class CheckpointManager:
         output_dir: str,
         max_to_keep: int = 3,
         save_interval_steps: int = 500,
+        gcs_dir: Optional[str] = None,
     ):
         self.output_dir = output_dir
         self.save_interval_steps = save_interval_steps
+        self._gcs_dir = gcs_dir
 
         options = ocp.CheckpointManagerOptions(
             max_to_keep=max_to_keep,
             save_interval_steps=save_interval_steps,
+            enable_async_checkpointing=False,
         )
         self.manager = ocp.CheckpointManager(
             output_dir,
@@ -49,7 +54,25 @@ class CheckpointManager:
             step,
             args=ocp.args.StandardSave(state),
         )
+        self.manager.wait_until_finished()
         logger.info("Checkpoint saved at step %d", step)
+        if self._gcs_dir and jax.process_index() == 0:
+            self._sync_to_gcs(step)
+
+    def _sync_to_gcs(self, step: int):
+        """Upload a checkpoint step directory to GCS."""
+        import subprocess
+
+        src = os.path.join(self.output_dir, str(step))
+        dst = self._gcs_dir.rstrip("/") + "/" + str(step) + "/"
+        try:
+            subprocess.run(
+                ["gcloud", "storage", "cp", "-r", src, dst],
+                check=True, capture_output=True, text=True,
+            )
+            logger.info("Checkpoint step %d synced to %s", step, dst)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logger.warning("Failed to sync checkpoint to GCS: %s", e)
 
     def restore(self, step: Optional[int] = None, state_template=None):
         """Restore training state.

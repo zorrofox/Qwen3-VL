@@ -50,6 +50,9 @@ REPORT_TO="${REPORT_TO:-none}"
 RUN_NAME="${RUN_NAME:-qwen3vl-jax}"
 LOGGING_DIR="${LOGGING_DIR:-}"
 
+# GCS upload (model + checkpoint sync)
+GCS_OUTPUT_DIR="${GCS_OUTPUT_DIR:-}"
+
 # Checkpointing
 SAVE_STEPS="${SAVE_STEPS:-1000}"
 MAX_CHECKPOINTS="${MAX_CHECKPOINTS:-3}"
@@ -75,6 +78,9 @@ echo "=============================="
 EXTRA_ARGS=()
 if [ -n "${LOGGING_DIR}" ]; then
     EXTRA_ARGS+=(--logging_dir "${LOGGING_DIR}")
+fi
+if [ -n "${GCS_OUTPUT_DIR}" ]; then
+    EXTRA_ARGS+=(--gcs_output_dir "${GCS_OUTPUT_DIR}")
 fi
 
 python3 -m jax_qwenvl.train.train \
