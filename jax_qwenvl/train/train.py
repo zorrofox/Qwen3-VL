@@ -92,6 +92,7 @@ class TrainingArguments:
     report_to: str = "none"
     run_name: str = ""
     warmup_ratio: float = 0.0
+    logging_dir: Optional[str] = None  # tensorboard log dir (supports GCS paths); defaults to output_dir
 
 
 # ---------------------------------------------------------------------------
@@ -236,8 +237,30 @@ def main():
     _add_dataclass_args(parser, TrainingArguments)
     model_args, data_args, training_args = _make_args(parser)
 
-    os.makedirs(training_args.output_dir, exist_ok=True)
-    logger.info("JAX devices: %s", jax.devices())
+    # Initialize JAX distributed runtime.
+    # On TPU pod slices (multi-host), this sets up inter-host communication
+    # and is required for Orbax multi-host checkpointing.
+    # On single-host TPU, this is a safe no-op.
+    try:
+        jax.distributed.initialize()
+    except Exception as e:
+        logger.warning("jax.distributed.initialize() skipped (single-host): %s", e)
+
+    # Ensure output_dir is absolute (Orbax requires absolute paths in multi-host mode)
+    training_args.output_dir = os.path.abspath(training_args.output_dir)
+
+    # Multi-host awareness
+    num_processes = jax.process_count()
+    process_index = jax.process_index()
+    is_main_process = process_index == 0
+
+    if is_main_process:
+        os.makedirs(training_args.output_dir, exist_ok=True)
+    logger.info(
+        "JAX process %d/%d | local_devices=%d | global_devices=%d | devices=%s",
+        process_index, num_processes,
+        jax.local_device_count(), jax.device_count(), jax.devices(),
+    )
     logger.info("Model: %s", model_args.model_name_or_path)
 
     # 2. Load config
@@ -368,21 +391,30 @@ def main():
         warmup_steps = int(total_steps * training_args.warmup_ratio)
         logger.info("Using warmup_ratio=%.3f -> warmup_steps=%d", training_args.warmup_ratio, warmup_steps)
 
-    # Create metrics logger
-    metrics_logger = MetricsLogger(
-        output_dir=training_args.output_dir,
-        report_to=training_args.report_to,
-        run_name=training_args.run_name,
-        config={
-            "learning_rate": training_args.learning_rate,
-            "num_train_epochs": training_args.num_train_epochs,
-            "per_device_train_batch_size": training_args.per_device_train_batch_size,
-            "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
-            "model_name_or_path": model_args.model_name_or_path,
-            "warmup_steps": warmup_steps,
-            "total_steps": total_steps,
-        },
-    )
+    # Create metrics logger (only on main process to avoid duplicate writes)
+    if is_main_process:
+        metrics_logger = MetricsLogger(
+            output_dir=training_args.output_dir,
+            report_to=training_args.report_to,
+            run_name=training_args.run_name,
+            config={
+                "learning_rate": training_args.learning_rate,
+                "num_train_epochs": training_args.num_train_epochs,
+                "per_device_train_batch_size": training_args.per_device_train_batch_size,
+                "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
+                "model_name_or_path": model_args.model_name_or_path,
+                "warmup_steps": warmup_steps,
+                "total_steps": total_steps,
+                "num_processes": num_processes,
+                "global_devices": jax.device_count(),
+            },
+            logging_dir=training_args.logging_dir,
+        )
+    else:
+        metrics_logger = MetricsLogger(
+            output_dir=training_args.output_dir,
+            report_to="none",
+        )
 
     # 10. Create optimizer
     optimizer, label_tree = create_optimizer(
@@ -465,7 +497,7 @@ def main():
                         global_step += 1
                         tokens_per_sec = total_tokens / max(step_elapsed, 1e-6)
 
-                        if global_step % training_args.logging_steps == 0:
+                        if is_main_process and global_step % training_args.logging_steps == 0:
                             avg_loss = epoch_loss / max(epoch_steps, 1)
                             elapsed = time.time() - t0
                             logger.info(
@@ -511,7 +543,7 @@ def main():
                     global_step += 1
                     tokens_per_sec = total_tokens / max(step_elapsed, 1e-6)
 
-                    if global_step % training_args.logging_steps == 0:
+                    if is_main_process and global_step % training_args.logging_steps == 0:
                         avg_loss = epoch_loss / max(epoch_steps, 1)
                         elapsed = time.time() - t0
                         logger.info(
@@ -547,20 +579,21 @@ def main():
         # Final checkpoint save
         ckpt_manager.save(global_step, state, force=True)
 
-        # Export weights to HuggingFace format
-        logger.info("Exporting weights to HuggingFace safetensors format ...")
-        from jax_qwenvl.model.weight_exporter import export_hf_weights
-        export_hf_weights(
-            params=state.params,
-            output_dir=training_args.output_dir,
-            config=config,
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha,
-        )
+        # Export weights to HuggingFace format (only on main process)
+        if is_main_process:
+            logger.info("Exporting weights to HuggingFace safetensors format ...")
+            from jax_qwenvl.model.weight_exporter import export_hf_weights
+            export_hf_weights(
+                params=state.params,
+                output_dir=training_args.output_dir,
+                config=config,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+            )
 
-        # Save processor/tokenizer
-        processor.save_pretrained(training_args.output_dir)
-        logger.info("Processor saved to %s", training_args.output_dir)
+            # Save processor/tokenizer
+            processor.save_pretrained(training_args.output_dir)
+            logger.info("Processor saved to %s", training_args.output_dir)
 
     metrics_logger.finish()
     logger.info("Training complete. Output dir: %s", training_args.output_dir)

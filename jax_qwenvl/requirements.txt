@@ -25,3 +25,4 @@ torchvision>=0.25.0
 # Logging (optional)
 wandb>=0.24.0
 tensorboard>=2.20.0
+gcsfs>=2024.0.0  # GCS support for tensorboard logging
