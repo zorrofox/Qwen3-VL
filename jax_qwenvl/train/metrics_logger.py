@@ -28,11 +28,13 @@ class MetricsLogger:
         run_name: str = "",
         config: Optional[dict] = None,
         logging_dir: Optional[str] = None,
+        sync_interval: int = 100,
     ):
         self._writers = []
         self._summary_writer = None
         self._local_tb_dir: Optional[str] = None
         self._gcs_tb_dir: Optional[str] = None
+        self._sync_interval = sync_interval
 
         if "wandb" in report_to:
             try:
@@ -78,6 +80,15 @@ class MetricsLogger:
         if "tensorboard" in self._writers and self._summary_writer is not None:
             for k, v in metrics.items():
                 self._summary_writer.add_scalar(k, float(v), step)
+            # Periodically flush and sync to GCS to guard against spot preemption.
+            if (
+                self._gcs_tb_dir
+                and self._local_tb_dir
+                and step > 0
+                and step % self._sync_interval == 0
+            ):
+                self._summary_writer.flush()
+                self._sync_to_gcs(cleanup=False)
 
     def finish(self) -> None:
         """Clean up logging resources.
@@ -96,25 +107,41 @@ class MetricsLogger:
             if self._gcs_tb_dir and self._local_tb_dir:
                 self._sync_to_gcs()
 
-    def _sync_to_gcs(self) -> None:
-        """Copy local tensorboard event files to GCS via gsutil."""
+    def _sync_to_gcs(self, cleanup: bool = True) -> None:
+        """Copy local tensorboard event files to GCS.
+
+        Tries ``gcloud storage cp`` first, falling back to ``gsutil``.
+
+        Args:
+            cleanup: If True, remove the local temp directory after a
+                successful sync (used at ``finish()``).  If False, keep local
+                files so that subsequent events can still be appended (used for
+                periodic mid-training syncs).
+        """
         import subprocess
         src = self._local_tb_dir.rstrip("/") + "/"
         dst = self._gcs_tb_dir.rstrip("/") + "/"
         logger.info("Syncing tensorboard logs: %s -> %s", src, dst)
-        try:
-            subprocess.run(
-                ["gsutil", "-m", "cp", "-r", src, dst],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            logger.info("Tensorboard logs synced to %s", dst)
-            # Clean up local temp dir
-            shutil.rmtree(self._local_tb_dir, ignore_errors=True)
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            logger.warning(
-                "Failed to sync tensorboard logs to GCS: %s. "
-                "Local logs preserved at %s",
-                e, self._local_tb_dir,
-            )
+
+        # Try gcloud storage first (more reliable on TPU VMs), then gsutil.
+        commands = [
+            ["gcloud", "storage", "cp", "-r", src + "*", dst],
+            ["gsutil", "-m", "cp", "-r", src, dst],
+        ]
+        for cmd in commands:
+            try:
+                subprocess.run(
+                    cmd, check=True, capture_output=True, text=True,
+                )
+                logger.info("Tensorboard logs synced to %s", dst)
+                if cleanup:
+                    shutil.rmtree(self._local_tb_dir, ignore_errors=True)
+                return
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
+
+        logger.warning(
+            "Failed to sync tensorboard logs to GCS. "
+            "Local logs preserved at %s",
+            self._local_tb_dir,
+        )
