@@ -571,6 +571,78 @@ huggingface_hub==0.30.x
 
 ---
 
+## 多机训练（Multi-Host TPU Pod Slice）
+
+### 概述
+
+**日期**：2026-02-09
+**环境**：TPU v6e-16 spot (asia-northeast1-b)，4 hosts × 4 chips = 16 chips
+**数据集**：LLaVA-Instruct-150K（157,712 样本，COCO train2017）
+**模型**：Qwen3-VL-2B-Instruct (bfloat16)
+**配置**：per_device_batch=4, global_batch=64, model_max_length=1024, max_pixels=50176, gradient_checkpointing=True
+
+### 训练结果
+
+完整 1 epoch 训练（2464 步），总耗时 ~61 分钟：
+
+| Step | Loss | Avg Loss | Step Time | Tokens/s |
+|------|------|----------|-----------|----------|
+| 1 | 1.6649 | 1.6649 | 98.89s | 179 (XLA 编译) |
+| 2 | 1.6652 | 1.6650 | 101.50s | 173 (第2次 trace) |
+| 3 | 1.6337 | 1.6546 | **0.68s** | **25,993** |
+| 100 | 1.3062 | 1.4538 | 0.68s | 26,070 |
+| 500 | 1.2799 | 1.3198 | 0.68s | 26,707 |
+| 1000 | 1.2693 | 1.2923 | 0.68s | 26,221 |
+| 1500 | 1.2933 | 1.2814 | 0.68s | 24,436 |
+| 2000 | 1.2624 | 1.2757 | 0.68s | 24,972 |
+| 2464 | 1.2339 | **1.2727** | 0.68s | 24,977 |
+
+### 与单机 (v6e-4) 对比
+
+| 指标 | v6e-4 (4 chips) | v6e-16 (16 chips) |
+|------|-----------------|-------------------|
+| Global batch size | 16 | 64 |
+| Step time (after compilation) | 0.30s | 0.68s |
+| Throughput (tokens/s) | ~14,000 | ~25,000 |
+| 吞吐量提升 | — | **1.8x** |
+
+### 代码修改
+
+| 文件 | 变更 |
+|------|------|
+| `jax_qwenvl/train/train.py` | `jax.distributed.initialize()`（try-except 包裹），`output_dir` 强制绝对路径，`is_main_process` 守卫日志/保存/导出，`logging_dir` 参数 |
+| `jax_qwenvl/train/sharding.py` | `shard_batch()` 自动检测多机（`process_count > 1`），`_shard_batch_multihost()` 使用 `host_local_array_to_global_array` |
+| `jax_qwenvl/train/metrics_logger.py` | 替换 `flax.metrics.tensorboard` 为 `torch.utils.tensorboard`，GCS 路径写入本地临时目录 + `finish()` 时 gsutil 同步 |
+
+### 多机训练注意事项
+
+1. **所有 worker 必须同时运行训练脚本**：使用 `--worker=all` 参数
+   ```bash
+   gcloud compute tpus tpu-vm ssh VM_NAME --zone=ZONE --worker=all --command='...'
+   ```
+
+2. **`jax.distributed.initialize()` 必须调用**：Orbax 多机 checkpoint 需要显式初始化分布式系统
+
+3. **Orbax checkpoint 需要绝对路径**：相对路径在多机模式下会报错
+   ```
+   ValueError: Checkpoint path should be absolute. Got output_v6e16/...
+   ```
+
+4. **`max_pixels` 必须控制**：视觉注意力矩阵 `(num_heads, N, N)` 与 `max_total_patches` 的平方成正比
+   - `max_pixels=451584`（默认）+ batch=64 → `max_total_patches=112896` → OOM（406 GB attention matrix）
+   - `max_pixels=50176` + batch=64 → `max_total_patches=12544` → OK（~5 GB attention matrix）
+
+5. **单机兼容性**：所有多机修改向后兼容单机模式
+   - `jax.distributed.initialize()` 在 try-except 中，单机失败时安静跳过
+   - `shard_batch()` 通过 `process_count() > 1` 自动切换路径
+   - `MetricsLogger` 非主进程使用 `report_to="none"` 无操作
+
+6. **GCS tensorboard 不支持追加写入**：`torch.utils.tensorboard.SummaryWriter` 需要 `gcsfs`，但 GCS 不支持追加模式。解决方案：写入本地临时目录，训练结束后 gsutil 同步到 GCS
+
+7. **Spot TPU 随时可能被驱逐**：us-central1-b 多次被驱逐。建议开启 checkpoint 保存以支持断点续训
+
+---
+
 ## 下一步：待完成工作
 
 - MoE 模型支持（Expert Parallelism）
@@ -579,6 +651,8 @@ huggingface_hub==0.30.x
 - 推理/生成模式
 - 多图/视频样本的固定形状填充（当前假设每样本最多 1 张图）
 - 混合 text-only + vision batch 支持（当前要求每个 batch 都有图片）
+- 多机 checkpoint 到 GCS（当前只支持本地文件系统）
+- 视觉模型 DP 分片（当前视觉模型在所有设备上复制，浪费计算）
 
 ---
 
