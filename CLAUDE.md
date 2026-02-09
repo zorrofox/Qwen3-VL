@@ -145,6 +145,8 @@ Qwen3-VL/
 | `a59ac9c` | XLA 重编译修复（所有张量固定形状填充，~250x 加速） |
 | `7525c60` | CLAUDE.md 重命名 + 迁移记录更新 |
 | `1b1f516` | 多机训练支持（v6e-16, 4 hosts），LLaVA 完整 1 epoch 验证 |
+| `dafa706` | Tensorboard GCS 定期同步 + 固定 orbax-checkpoint 版本 |
+| `7839edf` | 修复 Orbax async checkpoint 多机崩溃 + GCS 模型/checkpoint 自动上传 |
 
 ---
 
@@ -228,7 +230,7 @@ Qwen3-VL/
 | 文件 | 行数 | 内容 |
 |---|---|---|
 | `jax_qwenvl/train/sharding.py` | 132 | `create_device_mesh()`, `get_param_sharding_rules()`, `shard_params()`, `shard_batch()` |
-| `jax_qwenvl/train/checkpoint.py` | 83 | `CheckpointManager` 封装 Orbax `ocp.CheckpointManager` |
+| `jax_qwenvl/train/checkpoint.py` | 107 | `CheckpointManager` 封装 Orbax（async 禁用 + GCS 同步） |
 
 #### 关键实现
 
@@ -236,7 +238,7 @@ Qwen3-VL/
 2. **Batch 分片**：`position_ids` 特殊处理（shape `(3, B, L)`，batch 在 axis=1：`P(None, 'dp', None)`）
 3. **梯度累积**：`jax.lax.scan` 在 JIT 内循环累积，平均后 `apply_gradients`
 4. **梯度检查点**：`nn.remat(DecoderLayer, policy=nothing_saveable)` 和 `nn.remat(VisionBlock)`
-5. **Checkpoint**：Orbax `StandardSave`/`StandardRestore`，支持分片参数自动处理
+5. **Checkpoint**：Orbax `StandardSave`/`StandardRestore`，`enable_async_checkpointing=False`（多机 async 崩溃修复），支持 GCS 同步
 
 #### TrainingArguments 字段
 
@@ -249,6 +251,7 @@ resume_from_checkpoint: Optional[str]   # checkpoint 恢复路径
 report_to: str = "none"                # "wandb", "tensorboard", "none"
 run_name: str = ""                      # wandb/tensorboard run 名称
 warmup_ratio: float = 0.0              # 若 > 0 且 warmup_steps == 0，则从 ratio 计算
+gcs_output_dir: Optional[str] = None   # GCS 路径，自动上传模型和 checkpoint
 ```
 
 ---
@@ -264,7 +267,7 @@ warmup_ratio: float = 0.0              # 若 > 0 且 warmup_steps == 0，则从 
 |---|---|---|
 | `jax_qwenvl/model/weight_exporter.py` | 416 | LoRA 合并 + Flax→HF safetensors 导出（反向 key 映射 + 转置 + 分片保存） |
 | `jax_qwenvl/train/metrics_logger.py` | 60 | wandb + tensorboard 统一日志封装（report_to="none" 时为 no-op） |
-| `jax_qwenvl/scripts/train_tpu.sh` | 102 | TPU 训练启动脚本（环境变量覆盖所有参数） |
+| `jax_qwenvl/scripts/train_tpu.sh` | 117 | TPU 训练启动脚本（环境变量覆盖所有参数，含 GCS_OUTPUT_DIR） |
 
 #### 关键实现
 
@@ -567,7 +570,8 @@ huggingface_hub==0.30.x
 | HuggingFace 下载失败 | 网络超时或 401 | 设置 `HF_TOKEN` 环境变量 |
 | OOM（float32 2B 模型） | `RESOURCE_EXHAUSTED` | 使用 bfloat16 + gradient checkpointing |
 | SSH 连接超时 | `Connection timed out` | 检查防火墙规则或使用 `--tunnel-through-iap` |
-| Checkpoint async 错误 | `Array has been deleted` | 使用 `enable_async_checkpointing=False` |
+| Checkpoint async 错误（单机） | `Array has been deleted` | 使用 `enable_async_checkpointing=False`（已默认禁用） |
+| Checkpoint async 错误（多机） | `cannot schedule new futures after shutdown` | 使用 `enable_async_checkpointing=False`（已默认禁用） |
 | XLA 每步重编译 | step time 不下降（60-100s/步） | 检查所有输入张量是否填充到固定形状 |
 | tokenizer model_max_length 过大 | 编译挂起或 OOM | 使用 training_args.model_max_length 而非 tokenizer 默认值 |
 
@@ -612,9 +616,11 @@ huggingface_hub==0.30.x
 
 | 文件 | 变更 |
 |------|------|
-| `jax_qwenvl/train/train.py` | `jax.distributed.initialize()`（try-except 包裹），`output_dir` 强制绝对路径，`is_main_process` 守卫日志/保存/导出，`logging_dir` 参数 |
+| `jax_qwenvl/train/train.py` | `jax.distributed.initialize()`（try-except 包裹），`output_dir` 强制绝对路径，`is_main_process` 守卫日志/保存/导出，`logging_dir` 参数，`gcs_output_dir` 参数 + `_upload_to_gcs()` 训练后自动上传模型 |
 | `jax_qwenvl/train/sharding.py` | `shard_batch()` 自动检测多机（`process_count > 1`），`_shard_batch_multihost()` 使用 `host_local_array_to_global_array` |
 | `jax_qwenvl/train/metrics_logger.py` | 替换 `flax.metrics.tensorboard` 为 `torch.utils.tensorboard`，GCS 路径写入本地临时目录 + `finish()` 时 gsutil 同步 |
+| `jax_qwenvl/train/checkpoint.py` | `enable_async_checkpointing=False` 修复多机崩溃，`gcs_dir` 参数 + `_sync_to_gcs()` checkpoint 自动同步 |
+| `jax_qwenvl/scripts/train_tpu.sh` | 新增 `GCS_OUTPUT_DIR` 环境变量 |
 
 ### 多机训练注意事项
 
@@ -643,6 +649,13 @@ huggingface_hub==0.30.x
 
 7. **Spot TPU 随时可能被驱逐**：us-central1-b 多次被驱逐。建议开启 checkpoint 保存以支持断点续训
 
+8. **Orbax async checkpoint 在多机模式下崩溃**：`ckpt_manager.save(force=True)` 使用 async checkpointing 时，在 processes 1/2/3 上报 `RuntimeError: cannot schedule new futures after shutdown`，导致 checkpoint 卡在 `.orbax-checkpoint-tmp-0` 目录未 finalize。已通过 `enable_async_checkpointing=False` 修复
+
+9. **GCS 模型/checkpoint 自动上传**：通过 `--gcs_output_dir gs://bucket/path` 参数启用：
+   - 每次 checkpoint 保存后自动同步到 `gs://.../path/<step>/`（仅 process 0）
+   - 训练完成后自动上传 safetensors + json + jinja 模型文件到 GCS
+   - 使用 `gcloud storage cp` 上传，失败时 warning 不中断训练
+
 ---
 
 ## 下一步：待完成工作
@@ -653,7 +666,7 @@ huggingface_hub==0.30.x
 - 推理/生成模式
 - 多图/视频样本的固定形状填充（当前假设每样本最多 1 张图）
 - 混合 text-only + vision batch 支持（当前要求每个 batch 都有图片）
-- 多机 checkpoint 到 GCS（当前只支持本地文件系统）
+- ~~多机 checkpoint 到 GCS~~（已完成：`gcs_output_dir` 参数支持 checkpoint + 模型自动上传）
 - 视觉模型 DP 分片（当前视觉模型在所有设备上复制，浪费计算）
 
 ---
