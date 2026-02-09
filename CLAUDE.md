@@ -143,6 +143,8 @@ Qwen3-VL/
 | `de3c208` | 端到端真实图片训练验证，vision pipeline bug 修复 |
 | `a0b260a` | LLaVA-Instruct-150K 数据集支持，训练 pipeline 修复 |
 | `a59ac9c` | XLA 重编译修复（所有张量固定形状填充，~250x 加速） |
+| `7525c60` | CLAUDE.md 重命名 + 迁移记录更新 |
+| `1b1f516` | 多机训练支持（v6e-16, 4 hosts），LLaVA 完整 1 epoch 验证 |
 
 ---
 
