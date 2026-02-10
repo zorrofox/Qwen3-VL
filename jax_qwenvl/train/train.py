@@ -82,6 +82,7 @@ class TrainingArguments:
     projector_lr: Optional[float] = None
     logging_steps: int = 10
     save_steps: int = 500
+    max_steps: int = -1
     bf16: bool = True
     seed: int = 42
     gradient_accumulation_steps: int = 1
@@ -410,6 +411,8 @@ def main():
         )
     steps_per_epoch = max(dataset_size // batch_size, 1)
     total_steps = steps_per_epoch * training_args.num_train_epochs
+    if training_args.max_steps > 0:
+        total_steps = min(total_steps, training_args.max_steps)
     logger.info(
         "Dataset size=%d, per_device_batch=%d, num_dp_devices=%d, "
         "global_batch=%d, steps_per_epoch=%d, total_steps=%d",
@@ -556,6 +559,11 @@ def main():
 
                         if ckpt_manager.should_save(global_step):
                             ckpt_manager.save(global_step, state)
+
+                        if training_args.max_steps > 0 and global_step >= training_args.max_steps:
+                            break
+                    if training_args.max_steps > 0 and global_step >= training_args.max_steps:
+                        break
             else:
                 for batch_idx_list in batch_iter:
                     samples = [dataset[i] for i in batch_idx_list]
@@ -603,14 +611,25 @@ def main():
                     if ckpt_manager.should_save(global_step):
                         ckpt_manager.save(global_step, state)
 
+                    if training_args.max_steps > 0 and global_step >= training_args.max_steps:
+                        break
+
             avg_loss = epoch_loss / max(epoch_steps, 1)
             logger.info(
                 "Epoch %d complete | avg_loss=%.4f | steps=%d",
                 epoch, avg_loss, epoch_steps,
             )
 
-        # Final checkpoint save
-        ckpt_manager.save(global_step, state, force=True)
+            if training_args.max_steps > 0 and global_step >= training_args.max_steps:
+                break
+
+        # Wait for any pending checkpoint, then save final checkpoint
+        ckpt_manager.wait_for_completion()
+        try:
+            ckpt_manager.save(global_step, state, force=True)
+            ckpt_manager.wait_for_completion()
+        except Exception as e:
+            logger.warning("Final checkpoint save failed: %s", e)
 
         # Export weights to HuggingFace format (only on main process)
         if is_main_process:

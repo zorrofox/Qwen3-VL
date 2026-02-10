@@ -53,6 +53,9 @@ LOGGING_DIR="${LOGGING_DIR:-}"
 # GCS upload (model + checkpoint sync)
 GCS_OUTPUT_DIR="${GCS_OUTPUT_DIR:-}"
 
+# Step limit (set > 0 to stop early, -1 = full epoch)
+MAX_STEPS="${MAX_STEPS:--1}"
+
 # Checkpointing
 SAVE_STEPS="${SAVE_STEPS:-1000}"
 MAX_CHECKPOINTS="${MAX_CHECKPOINTS:-3}"
@@ -81,6 +84,9 @@ if [ -n "${LOGGING_DIR}" ]; then
 fi
 if [ -n "${GCS_OUTPUT_DIR}" ]; then
     EXTRA_ARGS+=(--gcs_output_dir "${GCS_OUTPUT_DIR}")
+fi
+if [ "${MAX_STEPS}" != "-1" ]; then
+    EXTRA_ARGS+=(--max_steps "${MAX_STEPS}")
 fi
 
 python3 -m jax_qwenvl.train.train \
