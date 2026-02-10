@@ -149,7 +149,8 @@ Qwen3-VL/
 | `7839edf` | 修复 Orbax async checkpoint 多机崩溃 + GCS 模型/checkpoint 自动上传 |
 | `512a846` | 修复多机 checkpoint 死锁（bypass Orbax）+ transformers 5.x 图片加载 + max_steps |
 | `21428c7` | Checkpoint 断点续训：re-shard restored state + 恢复 global_step + GCS 路径修复 |
-| `TBD` | JAX 0.6.2 → 0.9.0 升级：Python 3.11+ venv，XLA 编译加速 35% |
+| `8500f81` | JAX 0.6.2 → 0.9.0 升级：Python 3.11+ venv，XLA 编译加速 35% |
+| `ed78fc1` | Orbax 原生 GCS checkpoint：删除 bypass 代码，StandardRestore 自动 re-shard |
 
 ---
 
@@ -233,7 +234,7 @@ Qwen3-VL/
 | 文件 | 行数 | 内容 |
 |---|---|---|
 | `jax_qwenvl/train/sharding.py` | 132 | `create_device_mesh()`, `get_param_sharding_rules()`, `shard_params()`, `shard_batch()` |
-| `jax_qwenvl/train/checkpoint.py` | 107 | `CheckpointManager` 封装 Orbax（async 禁用 + GCS 同步） |
+| `jax_qwenvl/train/checkpoint.py` | 86 | `CheckpointManager` 封装 Orbax（GCS 原生多机支持） |
 
 #### 关键实现
 
@@ -241,7 +242,7 @@ Qwen3-VL/
 2. **Batch 分片**：`position_ids` 特殊处理（shape `(3, B, L)`，batch 在 axis=1：`P(None, 'dp', None)`）
 3. **梯度累积**：`jax.lax.scan` 在 JIT 内循环累积，平均后 `apply_gradients`
 4. **梯度检查点**：`nn.remat(DecoderLayer, policy=nothing_saveable)` 和 `nn.remat(VisionBlock)`
-5. **Checkpoint**：单机用 Orbax `CheckpointManager`（sync 模式），多机用 process-0-only `flax.serialization`（Orbax 0.11.15 多机 barrier 死锁，需共享文件系统），支持 GCS 同步
+5. **Checkpoint**：Orbax `CheckpointManager` 直接指向 `gs://` 路径，原生多机协调（JAX 0.9.0 + Orbax 0.11.32），无需手动 GCS 同步或 re-shard
 
 #### TrainingArguments 字段
 
@@ -619,13 +620,11 @@ orbax-checkpoint==0.11.15
 | OOM（float32 2B 模型） | `RESOURCE_EXHAUSTED` | 使用 bfloat16 + gradient checkpointing |
 | SSH 连接超时 | `Connection timed out` | 检查防火墙规则或使用 `--tunnel-through-iap` |
 | Checkpoint async 错误（单机） | `Array has been deleted` | 使用 `enable_async_checkpointing=False`（已默认禁用） |
-| Checkpoint 多机死锁 | `Timed out waiting for array_metadatas` 或 barrier hang | Orbax 0.11.15 多机需共享文件系统（GCS/NFS）。当前方案：bypass Orbax，process-0-only 用 flax.serialization 保存 |
+| Checkpoint 多机死锁 | `Timed out waiting for array_metadatas` 或 barrier hang | 使用 JAX 0.9.0 + Orbax 0.11.32，`CheckpointManager` 指向 `gs://` 路径（已默认启用） |
 | transformers 5.x 图片加载 | `Incorrect padding` (base64 decode) | 在 `_build_messages()` 中用 `PIL.Image.open()` 预加载图片，不传路径字符串 |
 | XLA 每步重编译 | step time 不下降（60-100s/步） | 检查所有输入张量是否填充到固定形状 |
 | tokenizer model_max_length 过大 | 编译挂起或 OOM | 使用 training_args.model_max_length 而非 tokenizer 默认值 |
-| Checkpoint 恢复后 loss 跳回初始值 | restored state 未 re-shard 到 device mesh | 确保恢复后调用 `shard_params()` + `jax.device_put(opt_state, replicate)` |
-| GCS checkpoint 路径嵌套 | `gs://bucket/100/100/state.msgpack` | 使用 `cp -r src/* dst/` 而非 `cp -r src dst/` |
-| 多机恢复找不到 checkpoint | 其他 host 本地无文件 | 恢复前调用 `download_from_gcs()`（已自动集成） |
+| Checkpoint 恢复后 loss 跳回初始值 | restored state 未正确放到 device mesh | Orbax `StandardRestore` 使用 template 的 sharding 自动恢复到正确设备（已默认启用） |
 
 ---
 
@@ -671,7 +670,7 @@ orbax-checkpoint==0.11.15
 | `jax_qwenvl/train/train.py` | `jax.distributed.initialize()`（try-except 包裹），`output_dir` 强制绝对路径，`is_main_process` 守卫日志/保存/导出，`logging_dir` 参数，`gcs_output_dir` 参数 + `_upload_to_gcs()` 训练后自动上传模型 |
 | `jax_qwenvl/train/sharding.py` | `shard_batch()` 自动检测多机（`process_count > 1`），`_shard_batch_multihost()` 使用 `host_local_array_to_global_array` |
 | `jax_qwenvl/train/metrics_logger.py` | 替换 `flax.metrics.tensorboard` 为 `torch.utils.tensorboard`，GCS 路径写入本地临时目录 + `finish()` 时 gsutil 同步 |
-| `jax_qwenvl/train/checkpoint.py` | `enable_async_checkpointing=False` 修复多机崩溃，`gcs_dir` 参数 + `_sync_to_gcs()` checkpoint 自动同步 |
+| `jax_qwenvl/train/checkpoint.py` | Orbax `CheckpointManager` 直接指向 `gs://` 路径，原生多机协调，无手动 GCS 同步 |
 | `jax_qwenvl/scripts/train_tpu.sh` | 新增 `GCS_OUTPUT_DIR` 环境变量 |
 
 ### 多机训练注意事项
@@ -701,40 +700,13 @@ orbax-checkpoint==0.11.15
 
 7. **Spot TPU 随时可能被驱逐**：us-central1-b 多次被驱逐。建议开启 checkpoint 保存以支持断点续训
 
-8. **Orbax 0.11.15 多机 checkpoint 死锁**：Orbax 的 `CheckpointManager` 和 `StandardCheckpointer` 在多机模式下都会死锁。根本原因：Orbax 要求 checkpoint 目录对所有 host 可见（GCS 或 NFS），但本地路径 `~/output` 只有本机能看到。解决方案：
-   - **当前**：bypass Orbax，process-0-only 用 `jax.device_get()` + `flax.serialization.to_bytes()` 保存（DP 模式每个 host 有完整参数副本）
-   - **推荐长期方案**：使用 `gs://` 路径作为 Orbax checkpoint 目录（MaxText 的做法），这样所有 host 都能看到目录
-   - 多机 checkpoint 每次 ~11 GB，耗时 15-55 秒（msgpack 序列化 + 磁盘写入）
+8. **Orbax 原生 GCS checkpoint**：`--gcs_output_dir gs://bucket/path` 参数启用后，`CheckpointManager` 直接指向 `gs://.../path/checkpoints/`，所有 host 通过 GCS 读写 checkpoint，无需 `gcloud` CLI 或手动同步。Orbax 使用 tensorstore/zarr 格式（比 msgpack 更高效）
 
-9. **GCS 模型/checkpoint 自动上传**：通过 `--gcs_output_dir gs://bucket/path` 参数启用：
-   - 每次 checkpoint 保存后自动同步到 `gs://.../path/<step>/`（仅 process 0）
-   - 训练完成后自动上传 safetensors + json + jinja 模型文件到 GCS
-   - 使用 `gcloud storage cp` 上传，失败时 warning 不中断训练
+9. **GCS 模型自动上传**：训练完成后自动上传 safetensors + json + jinja 模型文件到 `gcs_output_dir`（仅 process 0，使用 `gcloud storage cp`）
 
 ---
 
 ## Checkpoint 断点续训
-
-### 修复的问题
-
-**日期**：2026-02-10
-**Commit**：`21428c7`
-
-| 问题 | 原因 | 修复 |
-|------|------|------|
-| `global_step` 恢复后从 0 开始 | `train.py` 硬编码 `global_step = 0`，未读取 `state.step` | 从 `state.step` 恢复 `global_step` |
-| 恢复的 state 未分片到 device mesh | `flax.serialization.from_bytes` 返回 numpy 数组，不在 TPU 上 | 恢复后 `shard_params()` + `jax.device_put(replicate)` |
-| GCS checkpoint 路径双重嵌套 | `gcloud storage cp -r /path/100 gs://bucket/100/` → `gs://bucket/100/100/state.msgpack` | 改为 `cp -r /path/100/* gs://bucket/100/` 上传目录内容 |
-| 多机恢复时其他 host 无 checkpoint | checkpoint 仅存在于 process 0 本地 + GCS | 新增 `download_from_gcs()` 方法，所有 host 在 restore 前从 GCS 下载 |
-| `train_tpu.sh` 无 resume 支持 | 缺少环境变量 | 新增 `RESUME_FROM_CHECKPOINT` 环境变量 |
-
-### 代码修改
-
-| 文件 | 变更 |
-|------|------|
-| `jax_qwenvl/train/checkpoint.py` | 修复 `_sync_to_gcs()` 路径嵌套（`src/*` 而非 `src`）+ 新增 `download_from_gcs()` 方法（扫描 GCS 最新 step → 下载到本地） |
-| `jax_qwenvl/train/train.py` | 恢复后 re-shard params（`shard_params`）+ replicate opt_state（`jax.device_put(x, NamedSharding(mesh, P()))`）+ 从 `state.step` 恢复 `global_step` + 恢复前调用 `download_from_gcs()` |
-| `jax_qwenvl/scripts/train_tpu.sh` | 新增 `RESUME_FROM_CHECKPOINT` 环境变量 |
 
 ### 使用方法
 
@@ -749,19 +721,18 @@ bash jax_qwenvl/scripts/train_tpu.sh
 
 ### 恢复流程
 
-1. `CheckpointManager.download_from_gcs()` — 扫描 GCS 目录找最新 step，下载 `state.msgpack` 到本地（所有 host）
-2. `CheckpointManager.restore(state_template=state)` — 用 `flax.serialization.from_bytes` 反序列化（返回 numpy 数组）
-3. `shard_params(restored.params, mesh, rules)` — 将 params 放到 device mesh（DP 模式复制，FSDP 模式分片）
-4. `jax.device_put(opt_state, NamedSharding(mesh, P()))` — opt_state 复制到所有设备
-5. `global_step = int(state.step)` — 恢复训练步数计数器
-6. 训练循环从 `global_step` 继续，`max_steps` 控制总步数上限
+1. `CheckpointManager.restore(state_template=state)` — Orbax 从 `gs://.../checkpoints/` 读取最新 step，使用 template 的 sharding 恢复到正确设备
+2. `state = restored` — 直接使用恢复的 state（无需手动 re-shard）
+3. `global_step = int(state.step)` — 恢复训练步数计数器
+4. 训练循环从 `global_step` 继续，`max_steps` 控制总步数上限
 
 ### 注意事项
 
 - **数据顺序**：恢复后数据从 epoch 开头重新迭代（deterministic seed），不会精确跟原训练对齐。optimizer state 正确恢复保证训练从正确的参数空间点继续
 - **`max_steps` 语义**：表示训练的**总步数上限**（包括已完成的步数），不是恢复后再跑的步数。从 step 100 恢复 + `max_steps=200` = 再跑 100 步
-- **GCS 路径**：`gcs_output_dir` 同时用于 checkpoint 上传和下载，确保恢复训练时使用与原训练相同的 GCS 路径
-- **单机兼容**：所有修改向后兼容单机模式。无 GCS 配置时 `download_from_gcs()` 为无操作
+- **GCS 路径**：`gcs_output_dir` 同时用于 checkpoint 保存和恢复，确保恢复训练时使用与原训练相同的 GCS 路径。Checkpoint 存储在 `<gcs_output_dir>/checkpoints/` 子目录下
+- **单机兼容**：无 GCS 配置时 checkpoint 保存到本地 `output_dir`
+- **无需手动 re-shard**：Orbax `StandardRestore` 使用 template 的 sharding 信息，恢复时自动放到正确的设备和分片
 
 ---
 
@@ -769,9 +740,9 @@ bash jax_qwenvl/scripts/train_tpu.sh
 
 ### 升级动机
 
-- Orbax 0.11.15 多机 checkpoint 死锁（当前 bypass Orbax 方案可用但非最优）
+- Orbax 0.11.15 多机 checkpoint 死锁（已通过升级到 Orbax 0.11.32 + GCS 路径解决）
 - JAX 0.9.0 的 Shardy 分区器 XLA 编译更快
-- Orbax 0.11.32 多机 checkpoint 原生支持（需 GCS 路径，后续优化）
+- Orbax 0.11.32 多机 checkpoint 原生支持（已启用，使用 `gs://` 路径）
 
 ### 升级步骤
 
@@ -808,8 +779,47 @@ bash jax_qwenvl/scripts/train_tpu.sh
 | `jax.experimental.multihost_utils.host_local_array_to_global_array` | 仍可用 |
 | `jax.tree_util.tree_map_with_path` | 无变化 |
 | `flax.linen` (nn.Module, nn.Dense, nn.remat 等) | 无变化（Linen API 已冻结） |
-| `flax.serialization.to_bytes/from_bytes` | 无变化 |
+| `flax.serialization.to_bytes/from_bytes` | 不再使用（Orbax 原生格式替代） |
 | `optax.chain/adamw/clip_by_global_norm` | 无变化 |
+
+---
+
+## Orbax 原生 GCS Checkpoint 迁移
+
+### 概述
+
+**日期**：2026-02-10
+**Commit**：`ed78fc1`
+
+升级到 JAX 0.9.0 + Orbax 0.11.32 后，将 checkpoint 系统从 process-0-only `flax.serialization` bypass 迁移到 Orbax 原生 `CheckpointManager` 直接指向 `gs://` 路径。
+
+### 改动
+
+| 文件 | 变更 |
+|------|------|
+| `jax_qwenvl/train/checkpoint.py` | 完全重写：86 行替代 294 行。删除 `_save_multihost`、`_restore_multihost`、`download_from_gcs`、`_sync_to_gcs`、`_cleanup_old`、`_latest_step_multihost` 及单机/多机分支逻辑 |
+| `jax_qwenvl/train/train.py` | 简化 resume：删除 `download_from_gcs()` 调用 + 删除手动 `shard_params` / `jax.device_put(opt_state)` re-shard + 删除 `NamedSharding`/`PartitionSpec` 导入 |
+
+### 删除的代码
+
+| 方法/功能 | 行数 | 原因 |
+|-----------|------|------|
+| `_save_multihost()` | ~40 | Orbax 原生多机保存 |
+| `_restore_multihost()` | ~20 | Orbax `StandardRestore` 替代 |
+| `download_from_gcs()` | ~40 | Orbax 直接读 GCS |
+| `_sync_to_gcs()` | ~20 | Orbax 直接写 GCS |
+| `_cleanup_old()` | ~15 | Orbax `max_to_keep` 管理 |
+| `_latest_step_multihost()` | ~10 | Orbax `latest_step()` 替代 |
+| 单机/多机分支逻辑 | ~30 | 统一代码路径 |
+| `train.py` 手动 re-shard | ~10 | `StandardRestore` 使用 template sharding |
+
+### 关键变化
+
+1. **Checkpoint 路径**：`gcs_dir` 提供时，checkpoint 存储在 `<gcs_dir>/checkpoints/` 子目录（避免与模型导出文件冲突）
+2. **存储格式**：从 msgpack（`flax.serialization`）变为 tensorstore/zarr（Orbax 原生格式）
+3. **多机协调**：所有 host 通过 GCS 直接读写，Orbax 内部处理同步，无需 `gcloud` CLI
+4. **恢复无需 re-shard**：`StandardRestore` 使用 state template 的 sharding 信息，恢复时自动放到正确设备
+5. **公共 API 不变**：`save()`、`restore()`、`latest_step()`、`should_save()`、`wait_for_completion()` 接口和参数完全相同
 
 ---
 
@@ -823,6 +833,7 @@ bash jax_qwenvl/scripts/train_tpu.sh
 - 混合 text-only + vision batch 支持（当前要求每个 batch 都有图片）
 - ~~多机 checkpoint 到 GCS~~（已完成：`gcs_output_dir` 参数支持 checkpoint + 模型自动上传）
 - ~~Checkpoint 断点续训~~（已完成：re-shard restored state + 恢复 global_step + GCS 下载 + 路径修复）
+- ~~Orbax 原生 GCS checkpoint~~（已完成：删除 bypass 代码，Orbax 0.11.32 直接写 GCS，StandardRestore 自动 re-shard）
 - 视觉模型 DP 分片（当前视觉模型在所有设备上复制，浪费计算）
 
 ---
