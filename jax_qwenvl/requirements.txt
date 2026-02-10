@@ -1,11 +1,15 @@
 # JAX/TPU training dependencies for Qwen3-VL
-# Install JAX with TPU support first:
-#   pip install 'jax[tpu]' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+# Requires Python 3.11+ (JAX 0.7.0+ dropped Python 3.10)
+# On v2-alpha-tpuv6e runtime (Python 3.10), create a venv first:
+#   sudo apt install python3.11 python3.11-venv python3.11-dev
+#   python3.11 -m venv ~/venv311 && source ~/venv311/bin/activate
+# Install JAX with TPU support:
+#   pip install 'jax[tpu]==0.9.0' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 
-jax[tpu]>=0.6.0
-flax>=0.10.0
-optax>=0.2.0
-orbax-checkpoint==0.11.15
+jax[tpu]==0.9.0
+flax>=0.12.0
+optax>=0.2.5
+orbax-checkpoint>=0.11.32
 
 transformers>=5.0.0
 accelerate>=1.10.0
