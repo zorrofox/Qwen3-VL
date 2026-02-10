@@ -107,21 +107,48 @@ Auto-detect multi-host via `jax.process_count() > 1`.
 ### Requirements
 
 1. **Absolute paths only** — Orbax rejects relative paths in multi-host mode
-2. **All hosts participate** — Orbax checkpoint is a collective operation
-3. **`jax.distributed.initialize()` must be called first**
+2. **`jax.distributed.initialize()` must be called first**
 
-### Guard saves to main process only
+### Orbax multi-host: shared filesystem required
+
+Orbax `CheckpointManager` and `StandardCheckpointer` are both multi-host aware — they internally call `sync_global_devices` barriers. For multi-host checkpointing to work, the checkpoint directory must be on a **shared filesystem** visible to all hosts (e.g., GCS, NFS). Local paths (`$HOME/output`) only work for single-host.
+
+**Option 1: GCS path (recommended long-term)**
+```python
+# All hosts participate in Orbax coordination via shared GCS directory
+ckpt_manager = ocp.CheckpointManager(
+    "gs://bucket/checkpoints",
+    options=ocp.CheckpointManagerOptions(
+        max_to_keep=3,
+        enable_async_checkpointing=False,
+    ),
+)
+ckpt_manager.save(step, args=ocp.args.StandardSave(state))
+```
+
+**Option 2: Bypass Orbax for DP mode (current approach)**
+
+In pure DP mode, all hosts have full parameter copies. Process 0 can save independently using `jax.device_get()` + `flax.serialization`:
 
 ```python
-is_main_process = jax.process_index() == 0
-
-if is_main_process and step % save_steps == 0:
-    ckpt_manager.save(step, train_state)
+if jax.process_index() == 0:
+    state_host = jax.device_get(state)
+    state_bytes = flax.serialization.to_bytes(state_host)
+    with open(os.path.join(output_dir, str(step), "state.msgpack"), "wb") as f:
+        f.write(state_bytes)
+# No explicit barrier needed — next train_step collective provides implicit sync
 ```
+
+This does NOT work with FSDP (parameters are sharded across hosts).
 
 ### Async checkpoint caveat
 
-Async checkpointing (`enable_async_checkpointing=True`) may cause `Array has been deleted` errors. Use `enable_async_checkpointing=False` if this occurs.
+Async checkpointing (`enable_async_checkpointing=True`) causes deadlocks in multi-host mode with Orbax 0.11.15 + JAX 0.6.2. Always use `enable_async_checkpointing=False`.
+
+Symptoms of async checkpoint failure:
+- `cannot schedule new futures after shutdown`
+- Hangs at "Waiting for Save Finalize thread (save_finalize) to complete"
+- Checkpoint stuck in `.orbax-checkpoint-tmp-0` directory (never finalized)
 
 ## Logging
 
