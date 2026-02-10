@@ -25,7 +25,6 @@ from jax_qwenvl.data.data_processor import LazySupervisedDataset, DataCollatorFo
 from jax_qwenvl.train.optimizer import create_optimizer
 from jax_qwenvl.train.train_state import create_train_state, TrainState
 from jax_qwenvl.train.train_step import train_step, train_step_with_accumulation
-from jax.sharding import NamedSharding, PartitionSpec as P
 from jax_qwenvl.train.sharding import create_device_mesh, get_param_sharding_rules, shard_params, shard_batch
 from jax_qwenvl.train.checkpoint import CheckpointManager
 from jax_qwenvl.train.metrics_logger import MetricsLogger
@@ -482,21 +481,11 @@ def main():
 
     # Resume from checkpoint if requested
     if training_args.resume_from_checkpoint:
-        # Download checkpoint from GCS if needed (all hosts)
-        ckpt_manager.download_from_gcs()
-
         restored = ckpt_manager.restore(state_template=state)
         if restored is not None:
-            # Re-shard params onto the device mesh (from_bytes returns numpy arrays)
-            with mesh:
-                restored_params = shard_params(restored.params, mesh, rules)
-            # Replicate opt_state across all devices (DP mode)
-            replicate = NamedSharding(mesh, P())
-            restored_opt = jax.tree_util.tree_map(
-                lambda x: jax.device_put(x, replicate) if hasattr(x, 'shape') else x,
-                restored.opt_state,
-            )
-            state = restored.replace(params=restored_params, opt_state=restored_opt)
+            # StandardRestore uses the template's sharding, so arrays are
+            # already on the correct devices — no manual re-shard needed.
+            state = restored
             logger.info("Resumed from step %d", int(state.step))
 
     logger.info("Starting training (first step includes XLA compilation) ...")
