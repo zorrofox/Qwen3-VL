@@ -36,8 +36,15 @@ gcloud compute tpus tpu-vm create VM_NAME \
     --version=v2-alpha-tpuv6e --spot
 ```
 
+### Check the VPC firewall
+To check the Firewall rules can let SSH connections.
+```
+gcloud compute firewall-rules list
+```
+
 ### SSH & Run Commands
 
+**Tunnel through IAP need extra IAM of the user, if you want to use this way pelease unsure this.**
 ```bash
 # Single-host SSH (via IAP tunnel)
 gcloud compute tpus tpu-vm ssh VM_NAME --zone=ZONE --tunnel-through-iap
