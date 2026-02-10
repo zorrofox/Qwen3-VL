@@ -17,6 +17,12 @@ class CheckpointManager:
 
     Handles saving/restoring ``TrainState`` with automatic step tracking
     and checkpoint rotation.
+
+    We set ``save_interval_steps=1`` in Orbax options so that Orbax
+    **always** saves when ``manager.save()`` is called.  The caller
+    (``train.py``) gates saves via ``should_save()`` instead.  This
+    avoids Orbax's internal interval logic silently skipping a save or
+    causing multi-host synchronisation issues.
     """
 
     def __init__(
@@ -32,7 +38,8 @@ class CheckpointManager:
 
         options = ocp.CheckpointManagerOptions(
             max_to_keep=max_to_keep,
-            save_interval_steps=save_interval_steps,
+            # Let Orbax save on every call; our should_save() decides when.
+            save_interval_steps=1,
             enable_async_checkpointing=False,
         )
         self.manager = ocp.CheckpointManager(
@@ -48,13 +55,14 @@ class CheckpointManager:
             state: ``TrainState`` pytree to save.
             force: if True, save regardless of interval.
         """
-        if not force and step % self.save_interval_steps != 0:
-            return
-        self.manager.save(
+        saved = self.manager.save(
             step,
             args=ocp.args.StandardSave(state),
+            force=force,
         )
-        self.manager.wait_until_finished()
+        if not saved:
+            logger.warning("Checkpoint at step %d was skipped by Orbax", step)
+            return
         logger.info("Checkpoint saved at step %d", step)
         if self._gcs_dir and jax.process_index() == 0:
             self._sync_to_gcs(step)

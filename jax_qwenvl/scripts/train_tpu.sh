@@ -25,7 +25,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-./output}"
 
 # Training hyperparameters
 BATCH_SIZE="${BATCH_SIZE:-4}"
-GRAD_ACCUM="${GRAD_ACCUM:-4}"
+GRAD_ACCUM="${GRAD_ACCUM:-1}"
 LR="${LR:-2e-7}"
 NUM_EPOCHS="${NUM_EPOCHS:-1}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
@@ -42,8 +42,8 @@ MAX_PIXELS="${MAX_PIXELS:-50176}"
 MIN_PIXELS="${MIN_PIXELS:-784}"
 
 # Data settings
-DATA_FLATTEN="${DATA_FLATTEN:-True}"
-MODEL_MAX_LENGTH="${MODEL_MAX_LENGTH:-8192}"
+DATA_FLATTEN="${DATA_FLATTEN:-False}"
+MODEL_MAX_LENGTH="${MODEL_MAX_LENGTH:-1024}"
 
 # Logging
 REPORT_TO="${REPORT_TO:-none}"
@@ -72,7 +72,7 @@ echo "Datasets:   ${DATASETS}"
 echo "Output:     ${OUTPUT_DIR}"
 echo "Batch size: ${BATCH_SIZE} (accum: ${GRAD_ACCUM})"
 echo "LR:         ${LR}"
-echo "Devices:    $(python3 -c 'import jax; print(len(jax.devices()))' 2>/dev/null || echo 'unknown')"
+echo "Devices:    $(timeout 5 python3 -c 'import jax; print(len(jax.devices()))' 2>/dev/null || echo 'unknown')"
 echo "=============================="
 
 EXTRA_ARGS=()
