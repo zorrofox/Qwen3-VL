@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
+import PIL.Image
 
 import transformers
 
@@ -149,10 +150,13 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
     if isinstance(videos, str):
         videos = [videos]
 
-    # Build media pools with absolute paths
-    image_pool = [
-        {"type": "image", "image": _make_abs_paths(base_path, img)} for img in images
-    ]
+    # Build media pools with pre-loaded PIL images
+    # (passing path strings can fail in transformers 5.x's load_image)
+    image_pool = []
+    for img in images:
+        img_path = _make_abs_paths(base_path, img)
+        pil_img = PIL.Image.open(img_path).convert("RGB")
+        image_pool.append({"type": "image", "image": pil_img})
     video_pool = [
         {"type": "video", "video": _make_abs_paths(base_path, vid)} for vid in videos
     ]
