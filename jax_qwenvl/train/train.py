@@ -483,9 +483,24 @@ def main():
     if training_args.resume_from_checkpoint:
         restored = ckpt_manager.restore(state_template=state)
         if restored is not None:
-            # StandardRestore uses the template's sharding, so arrays are
-            # already on the correct devices — no manual re-shard needed.
-            state = restored
+            # StandardRestore restores large arrays (params, mu, nu) with
+            # the template's global sharding, but opt_state scalars (e.g.
+            # Adam count) may end up on a single device per host.  Only
+            # re-shard leaves that aren't already on all global devices;
+            # converting large arrays to numpy would OOM.
+            from jax.sharding import NamedSharding, PartitionSpec as P
+            replicate = NamedSharding(mesh, P())
+            global_dev_count = jax.device_count()
+
+            def _ensure_global(x):
+                if not hasattr(x, 'shape'):
+                    return x
+                if isinstance(x, jax.Array) and len(x.devices()) == global_dev_count:
+                    return x  # already globally sharded
+                return jax.device_put(np.asarray(x), replicate)
+
+            restored_opt = jax.tree_util.tree_map(_ensure_global, restored.opt_state)
+            state = restored.replace(opt_state=restored_opt)
             logger.info("Resumed from step %d", int(state.step))
 
     logger.info("Starting training (first step includes XLA compilation) ...")
