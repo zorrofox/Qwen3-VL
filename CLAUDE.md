@@ -149,6 +149,7 @@ Qwen3-VL/
 | `7839edf` | 修复 Orbax async checkpoint 多机崩溃 + GCS 模型/checkpoint 自动上传 |
 | `512a846` | 修复多机 checkpoint 死锁（bypass Orbax）+ transformers 5.x 图片加载 + max_steps |
 | `21428c7` | Checkpoint 断点续训：re-shard restored state + 恢复 global_step + GCS 路径修复 |
+| `TBD` | JAX 0.6.2 → 0.9.0 升级：Python 3.11+ venv，XLA 编译加速 35% |
 
 ---
 
@@ -540,12 +541,24 @@ GCS 数据集路径：`gs://grhuang-02-vertex-ai/datasets/llava_data/`
 # 打包代码
 tar czf /tmp/jax_qwenvl.tar.gz jax_qwenvl/
 
-# 上传到 TPU VM
-gcloud compute tpus tpu-vm scp /tmp/jax_qwenvl.tar.gz qwen3vl-test:~ --zone=us-east5-b
+# 上传到 TPU VM（所有 worker）
+gcloud compute tpus tpu-vm scp /tmp/jax_qwenvl.tar.gz VM_NAME:~ --zone=ZONE --worker=all
 
-# 解压 + 安装依赖
-gcloud compute tpus tpu-vm ssh qwen3vl-test --zone=us-east5-b \
-    --command="tar xzf jax_qwenvl.tar.gz && pip install -r jax_qwenvl/requirements.txt"
+# 解压 + 安装 Python 3.11 + 创建 venv + 安装依赖（所有 worker）
+gcloud compute tpus tpu-vm ssh VM_NAME --zone=ZONE --worker=all --command='
+tar xzf jax_qwenvl.tar.gz && \
+sudo add-apt-repository -y ppa:deadsnakes/ppa && \
+sudo apt-get update -qq && \
+sudo apt-get install -y -qq python3.11 python3.11-venv python3.11-dev && \
+python3.11 -m venv ~/venv311 && \
+source ~/venv311/bin/activate && \
+pip install --upgrade pip && \
+pip install "jax[tpu]==0.9.0" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html && \
+pip install -r jax_qwenvl/requirements.txt
+'
+
+# 训练时需先激活 venv
+source ~/venv311/bin/activate
 ```
 
 ### 清理资源
@@ -557,7 +570,24 @@ gcloud compute firewall-rules delete allow-tpu-ssh-test --quiet
 
 ### Package 依赖兼容性
 
-#### 已验证的版本快照
+#### 已验证的版本快照（当前）
+
+```
+Python==3.11.14 (venv on v2-alpha-tpuv6e)
+jax==0.9.0
+jaxlib==0.9.0
+libtpu==0.0.34
+flax==0.12.3
+optax==0.2.7
+orbax-checkpoint==0.11.32
+numpy==2.3.5
+scipy==1.17.0
+safetensors==0.7.0
+transformers==5.1.0
+huggingface_hub==1.4.1
+```
+
+#### 历史版本快照（JAX 0.6.2，已废弃）
 
 ```
 jax==0.6.2
@@ -566,28 +596,25 @@ libtpu==0.0.17
 flax==0.10.7
 optax==0.2.5+
 orbax-checkpoint==0.11.15
-safetensors==0.5.x
-transformers==4.51.x+
-huggingface_hub==0.30.x
 ```
 
-#### orbax-checkpoint 版本兼容性（踩坑重点）
+#### orbax-checkpoint 版本兼容性
 
-与 JAX 0.6.2 兼容的版本**非常有限**：
-
-| orbax-checkpoint 版本 | 兼容性 | 错误信息 |
-|---|---|---|
-| **0.11.15** | 可用 | — |
-| 0.11.32 (最新) | 不可用 | `jax.sharding.set_mesh` 不是 context manager |
-| 0.10.0 | 不可用 | `jax._src.config.enable_memories` 缺失 |
-| 0.9.1 | 不可用 | `jax.lib.xla_extension.XlaRuntimeError` 已移除 |
+| orbax-checkpoint 版本 | JAX 0.6.2 | JAX 0.9.0 | 错误信息 |
+|---|---|---|---|
+| 0.9.1 | 不可用 | — | `XlaRuntimeError` 已移除 |
+| 0.10.0 | 不可用 | — | `enable_memories` 缺失 |
+| **0.11.15** | 可用 | 未测试 | — |
+| **0.11.32** | 不可用 | **可用** | JAX 0.6.2: `set_mesh` 不是 context manager |
 
 ### 常见问题排查
 
 | 问题 | 症状 | 解决方案 |
 |---|---|---|
 | JAX 无法检测 TPU | `Failed to get global TPU topology` | 使用 `v2-alpha-tpuv6e` runtime 重建 VM |
-| orbax checkpoint 崩溃 | `set_mesh` / `enable_memories` 错误 | 降级到 `orbax-checkpoint==0.11.15` |
+| orbax checkpoint 崩溃 | `set_mesh` / `enable_memories` 错误 | 升级到 JAX 0.9.0 + orbax 0.11.32（或降级到 orbax 0.11.15 + JAX 0.6.2） |
+| JAX 0.7.0+ 安装失败 | `No matching distribution found` | TPU runtime Python 3.10 不支持 JAX 0.7.0+，需安装 Python 3.11 并创建 venv |
+| TPU 被占用 | `The TPU is already in use by process with pid XXX` | `sudo kill -9 PID` 或 `pkill -9 -u $(whoami) python3` |
 | HuggingFace 下载失败 | 网络超时或 401 | 设置 `HF_TOKEN` 环境变量 |
 | OOM（float32 2B 模型） | `RESOURCE_EXHAUSTED` | 使用 bfloat16 + gradient checkpointing |
 | SSH 连接超时 | `Connection timed out` | 检查防火墙规则或使用 `--tunnel-through-iap` |
@@ -735,6 +762,54 @@ bash jax_qwenvl/scripts/train_tpu.sh
 - **`max_steps` 语义**：表示训练的**总步数上限**（包括已完成的步数），不是恢复后再跑的步数。从 step 100 恢复 + `max_steps=200` = 再跑 100 步
 - **GCS 路径**：`gcs_output_dir` 同时用于 checkpoint 上传和下载，确保恢复训练时使用与原训练相同的 GCS 路径
 - **单机兼容**：所有修改向后兼容单机模式。无 GCS 配置时 `download_from_gcs()` 为无操作
+
+---
+
+## JAX 0.6.2 → 0.9.0 升级
+
+### 升级动机
+
+- Orbax 0.11.15 多机 checkpoint 死锁（当前 bypass Orbax 方案可用但非最优）
+- JAX 0.9.0 的 Shardy 分区器 XLA 编译更快
+- Orbax 0.11.32 多机 checkpoint 原生支持（需 GCS 路径，后续优化）
+
+### 升级步骤
+
+1. **requirements.txt 版本更新**：`jax==0.9.0`, `flax>=0.12.0`, `orbax-checkpoint>=0.11.32`
+2. **Python 3.11 安装**：JAX 0.7.0+ 要求 Python 3.11+，v2-alpha-tpuv6e runtime 只有 Python 3.10
+   ```bash
+   sudo add-apt-repository -y ppa:deadsnakes/ppa
+   sudo apt-get install -y python3.11 python3.11-venv python3.11-dev
+   python3.11 -m venv ~/venv311
+   source ~/venv311/bin/activate
+   ```
+3. **训练代码**：零修改，所有 API 向后兼容
+
+### 验证结果
+
+**日期**：2026-02-10
+**环境**：v6e-16 spot (asia-northeast1-b)，4 hosts × 4 chips = 16 chips
+**配置**：同多机训练配置（per_device_batch=4, global_batch=64, max_steps=20）
+
+| 指标 | JAX 0.6.2 | JAX 0.9.0 | 变化 |
+|------|-----------|-----------|------|
+| XLA 编译 (step 1-2) | ~100s | ~65s | **35% 加速** |
+| 稳态 step time | 0.68s | 0.67s | 持平 |
+| Throughput | ~25,000 tok/s | ~25,000 tok/s | 持平 |
+| avg_loss (20步) | 1.6649 | 1.6697 | 一致 |
+
+### API 兼容性确认
+
+| API | 状态 |
+|-----|------|
+| `jax.jit`, `jax.value_and_grad` | 无变化 |
+| `jax.sharding.{Mesh, NamedSharding, PartitionSpec}` | 无变化 |
+| `jax.distributed.initialize()` | 无变化 |
+| `jax.experimental.multihost_utils.host_local_array_to_global_array` | 仍可用 |
+| `jax.tree_util.tree_map_with_path` | 无变化 |
+| `flax.linen` (nn.Module, nn.Dense, nn.remat 等) | 无变化（Linen API 已冻结） |
+| `flax.serialization.to_bytes/from_bytes` | 无变化 |
+| `optax.chain/adamw/clip_by_global_norm` | 无变化 |
 
 ---
 
