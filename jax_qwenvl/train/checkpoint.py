@@ -212,6 +212,65 @@ class CheckpointManager:
             logger.info("Removed old checkpoint step %d", old_step)
 
     # ------------------------------------------------------------------
+    # GCS download (for resume on fresh hosts)
+    # ------------------------------------------------------------------
+
+    def download_from_gcs(self, step: Optional[int] = None):
+        """Download a checkpoint from GCS to local ``output_dir``.
+
+        In multi-host mode, checkpoint files only exist on process 0's local
+        disk and (optionally) in GCS.  When resuming on a fresh VM, all hosts
+        need the checkpoint locally.  This method downloads from GCS so that
+        ``restore()`` can read the file.
+
+        Args:
+            step: checkpoint step to download.  If *None*, the latest step
+                directory in GCS is used.
+        """
+        if not self._gcs_dir:
+            return
+
+        import subprocess
+
+        if step is None:
+            # List step directories in GCS and pick the largest number
+            gcs_base = self._gcs_dir.rstrip("/") + "/"
+            try:
+                result = subprocess.run(
+                    ["gcloud", "storage", "ls", gcs_base],
+                    check=True, capture_output=True, text=True,
+                )
+                steps = []
+                for line in result.stdout.strip().splitlines():
+                    name = line.rstrip("/").rsplit("/", 1)[-1]
+                    if name.isdigit():
+                        steps.append(int(name))
+                if not steps:
+                    logger.warning("No checkpoint steps found in %s", gcs_base)
+                    return
+                step = max(steps)
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                logger.warning("Failed to list GCS checkpoints: %s", e)
+                return
+
+        local_dir = os.path.join(self.output_dir, str(step))
+        state_file = os.path.join(local_dir, "state.msgpack")
+        if os.path.isfile(state_file):
+            logger.info("Checkpoint step %d already exists locally, skipping download", step)
+            return
+
+        os.makedirs(local_dir, exist_ok=True)
+        src = self._gcs_dir.rstrip("/") + "/" + str(step) + "/"
+        try:
+            subprocess.run(
+                ["gcloud", "storage", "cp", "-r", src + "*", local_dir + "/"],
+                check=True, capture_output=True, text=True,
+            )
+            logger.info("Downloaded checkpoint step %d from %s", step, src)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logger.warning("Failed to download checkpoint from GCS: %s", e)
+
+    # ------------------------------------------------------------------
     # GCS sync
     # ------------------------------------------------------------------
 
@@ -219,11 +278,14 @@ class CheckpointManager:
         """Upload a checkpoint step directory to GCS."""
         import subprocess
 
-        src = os.path.join(self.output_dir, str(step))
+        # Trailing slash on src means "upload contents of dir", not the dir itself.
+        # Without it, `gcloud storage cp -r /path/100 gs://bucket/100/` creates
+        # gs://bucket/100/100/state.msgpack instead of gs://bucket/100/state.msgpack.
+        src = os.path.join(self.output_dir, str(step)) + "/"
         dst = self._gcs_dir.rstrip("/") + "/" + str(step) + "/"
         try:
             subprocess.run(
-                ["gcloud", "storage", "cp", "-r", src, dst],
+                ["gcloud", "storage", "cp", "-r", src + "*", dst],
                 check=True, capture_output=True, text=True,
             )
             logger.info("Checkpoint step %d synced to %s", step, dst)

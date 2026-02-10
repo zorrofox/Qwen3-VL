@@ -60,6 +60,7 @@ MAX_STEPS="${MAX_STEPS:--1}"
 SAVE_STEPS="${SAVE_STEPS:-1000}"
 MAX_CHECKPOINTS="${MAX_CHECKPOINTS:-3}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-True}"
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 
 # FSDP (set to True for multi-device FSDP)
 FSDP="${FSDP:-False}"
@@ -87,6 +88,9 @@ if [ -n "${GCS_OUTPUT_DIR}" ]; then
 fi
 if [ "${MAX_STEPS}" != "-1" ]; then
     EXTRA_ARGS+=(--max_steps "${MAX_STEPS}")
+fi
+if [ -n "${RESUME_FROM_CHECKPOINT}" ]; then
+    EXTRA_ARGS+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
 
 python3 -m jax_qwenvl.train.train \
