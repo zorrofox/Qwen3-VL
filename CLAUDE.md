@@ -151,6 +151,7 @@ Qwen3-VL/
 | `21428c7` | Checkpoint 断点续训：re-shard restored state + 恢复 global_step + GCS 路径修复 |
 | `8500f81` | JAX 0.6.2 → 0.9.0 升级：Python 3.11+ venv，XLA 编译加速 35% |
 | `ed78fc1` | Orbax 原生 GCS checkpoint：删除 bypass 代码，StandardRestore 自动 re-shard |
+| `8d4a002` | 修复多机 checkpoint resume opt_state sharding（v6e-16 验证通过） |
 
 ---
 
@@ -624,7 +625,8 @@ orbax-checkpoint==0.11.15
 | transformers 5.x 图片加载 | `Incorrect padding` (base64 decode) | 在 `_build_messages()` 中用 `PIL.Image.open()` 预加载图片，不传路径字符串 |
 | XLA 每步重编译 | step time 不下降（60-100s/步） | 检查所有输入张量是否填充到固定形状 |
 | tokenizer model_max_length 过大 | 编译挂起或 OOM | 使用 training_args.model_max_length 而非 tokenizer 默认值 |
-| Checkpoint 恢复后 loss 跳回初始值 | restored state 未正确放到 device mesh | Orbax `StandardRestore` 使用 template 的 sharding 自动恢复到正确设备（已默认启用） |
+| Checkpoint 恢复后 loss 跳回初始值 | restored state 未正确放到 device mesh | Orbax `StandardRestore` 使用 template sharding 恢复大数组；opt_state 标量需 `_ensure_global()` 选择性 re-shard（已内置） |
+| Checkpoint resume 多机 `incompatible devices` | opt_state 标量（Adam count）在单 host 设备上 | `_ensure_global()` 检查 `len(x.devices()) == global_device_count`，不足的转 numpy + replicate（已内置） |
 
 ---
 
@@ -722,9 +724,50 @@ bash jax_qwenvl/scripts/train_tpu.sh
 ### 恢复流程
 
 1. `CheckpointManager.restore(state_template=state)` — Orbax 从 `gs://.../checkpoints/` 读取最新 step，使用 template 的 sharding 恢复到正确设备
-2. `state = restored` — 直接使用恢复的 state（无需手动 re-shard）
+2. `_ensure_global(opt_state)` — 检查 opt_state 每个叶节点是否在所有 global devices 上；不足的（如 Adam `count` 标量）转为 numpy 后 `device_put` 到 replicated sharding
 3. `global_step = int(state.step)` — 恢复训练步数计数器
 4. 训练循环从 `global_step` 继续，`max_steps` 控制总步数上限
+
+### Opt_state sharding 问题（多机模式）
+
+**问题**：Orbax `StandardRestore` 使用 template 的 sharding 正确恢复大数组（params、Adam mu/nu），但 opt_state 标量（如 Adam `count`）在 template 中没有显式 global sharding，恢复后可能只在单个 host 的设备上，导致 `train_step` 报 `ValueError: Received incompatible devices for jitted computation`。
+
+**修复尝试**：
+1. ~~`jax.device_put(x, replicate)` 直接 re-shard~~ — 多机失败：local array 只有 4 devices，global sharding 需要 16 devices → `CopyArrays only supports destination device list of the same size`
+2. ~~`jax.device_put(np.asarray(x), replicate)` 全部转 numpy~~ — OOM：大数组（mu/nu ~2.7GB each）转 numpy 后 `process_allgather` 需要额外 2.3GB buffer，超出 HBM
+3. **`_ensure_global()` 选择性 re-shard** — 只对 `len(x.devices()) < global_device_count` 的叶节点转 numpy + replicate，跳过已正确分片的大数组
+
+**Commit**：`8d4a002`
+
+### 验证结果（v6e-16）
+
+**日期**：2026-02-10
+**环境**：v6e-16 spot (asia-northeast1-b)，4 hosts × 4 chips = 16 chips
+**配置**：per_device_batch=4, global_batch=64, max_steps=30, save_steps=10
+**GCS 路径**：`gs://grhuang-02-vertex-ai/qwen3vl-orbax-test/model/checkpoints/`
+
+#### Test 1：训练 20 步 + checkpoint 保存
+
+| 指标 | 结果 |
+|------|------|
+| Checkpoint step 10 | PASS — 所有 4 hosts 参与，~77s |
+| Checkpoint step 20 | PASS — 所有 4 hosts 参与，~74s |
+| avg_loss (20 步) | 1.6697 |
+| Step time (稳态) | 0.67s |
+| Throughput | ~25,000 tokens/s |
+| 格式 | Orbax tensorstore/zarr（非 msgpack） |
+| 存储 | GCS 原生读写，无 `gcloud` CLI |
+
+#### Test 2：从 checkpoint 恢复到 step 30
+
+| 指标 | 结果 |
+|------|------|
+| 恢复日志 | "Resumed from step 20"、"Resuming from global_step=20" |
+| 训练范围 | step 21 → step 30 |
+| Loss 连续性 | 1.6640 → 1.5902（未跳回初始值） |
+| avg_loss (10 步) | 1.6588 |
+| Checkpoint step 30 | PASS — 保存到 GCS，~80s |
+| 模型导出 | HF safetensors 自动上传到 GCS |
 
 ### 注意事项
 
@@ -732,7 +775,7 @@ bash jax_qwenvl/scripts/train_tpu.sh
 - **`max_steps` 语义**：表示训练的**总步数上限**（包括已完成的步数），不是恢复后再跑的步数。从 step 100 恢复 + `max_steps=200` = 再跑 100 步
 - **GCS 路径**：`gcs_output_dir` 同时用于 checkpoint 保存和恢复，确保恢复训练时使用与原训练相同的 GCS 路径。Checkpoint 存储在 `<gcs_output_dir>/checkpoints/` 子目录下
 - **单机兼容**：无 GCS 配置时 checkpoint 保存到本地 `output_dir`
-- **无需手动 re-shard**：Orbax `StandardRestore` 使用 template 的 sharding 信息，恢复时自动放到正确的设备和分片
+- **Opt_state re-shard**：`StandardRestore` 正确恢复大数组（params、mu、nu）的 sharding，但 opt_state 标量需要 `_ensure_global()` 选择性 re-shard（仅多机模式需要）
 
 ---
 
@@ -789,16 +832,16 @@ bash jax_qwenvl/scripts/train_tpu.sh
 ### 概述
 
 **日期**：2026-02-10
-**Commit**：`ed78fc1`
+**Commit**：`ed78fc1`（迁移）、`8d4a002`（多机 opt_state 修复）
 
-升级到 JAX 0.9.0 + Orbax 0.11.32 后，将 checkpoint 系统从 process-0-only `flax.serialization` bypass 迁移到 Orbax 原生 `CheckpointManager` 直接指向 `gs://` 路径。
+升级到 JAX 0.9.0 + Orbax 0.11.32 后，将 checkpoint 系统从 process-0-only `flax.serialization` bypass 迁移到 Orbax 原生 `CheckpointManager` 直接指向 `gs://` 路径。v6e-16 (4 hosts) 验证通过：checkpoint 保存/恢复/续训均正常。
 
 ### 改动
 
 | 文件 | 变更 |
 |------|------|
 | `jax_qwenvl/train/checkpoint.py` | 完全重写：86 行替代 294 行。删除 `_save_multihost`、`_restore_multihost`、`download_from_gcs`、`_sync_to_gcs`、`_cleanup_old`、`_latest_step_multihost` 及单机/多机分支逻辑 |
-| `jax_qwenvl/train/train.py` | 简化 resume：删除 `download_from_gcs()` 调用 + 删除手动 `shard_params` / `jax.device_put(opt_state)` re-shard + 删除 `NamedSharding`/`PartitionSpec` 导入 |
+| `jax_qwenvl/train/train.py` | 简化 resume：删除 `download_from_gcs()` + 删除手动 `shard_params`。新增 `_ensure_global()` 选择性 re-shard opt_state 标量（多机模式下 Adam count 等标量可能不在全局设备上） |
 
 ### 删除的代码
 
@@ -811,14 +854,14 @@ bash jax_qwenvl/scripts/train_tpu.sh
 | `_cleanup_old()` | ~15 | Orbax `max_to_keep` 管理 |
 | `_latest_step_multihost()` | ~10 | Orbax `latest_step()` 替代 |
 | 单机/多机分支逻辑 | ~30 | 统一代码路径 |
-| `train.py` 手动 re-shard | ~10 | `StandardRestore` 使用 template sharding |
+| `train.py` 手动全量 re-shard | ~10 | 替换为 `_ensure_global()` 选择性 re-shard（仅标量） |
 
 ### 关键变化
 
 1. **Checkpoint 路径**：`gcs_dir` 提供时，checkpoint 存储在 `<gcs_dir>/checkpoints/` 子目录（避免与模型导出文件冲突）
 2. **存储格式**：从 msgpack（`flax.serialization`）变为 tensorstore/zarr（Orbax 原生格式）
 3. **多机协调**：所有 host 通过 GCS 直接读写，Orbax 内部处理同步，无需 `gcloud` CLI
-4. **恢复无需 re-shard**：`StandardRestore` 使用 state template 的 sharding 信息，恢复时自动放到正确设备
+4. **恢复几乎无需 re-shard**：`StandardRestore` 使用 state template 的 sharding 恢复大数组（params、mu、nu）；仅 opt_state 标量需 `_ensure_global()` 选择性处理
 5. **公共 API 不变**：`save()`、`restore()`、`latest_step()`、`should_save()`、`wait_for_completion()` 接口和参数完全相同
 
 ---
