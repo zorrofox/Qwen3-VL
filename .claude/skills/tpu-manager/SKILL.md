@@ -74,9 +74,12 @@ gcloud compute tpus tpu-vm delete VM_NAME --zone=ZONE --quiet
 2. **Multi-host: all workers must run the script simultaneously** via `--worker=all`
 3. **Multi-host: call `jax.distributed.initialize()`** before any JAX operation
 4. **Multi-host: checkpoint paths must be absolute** — Orbax rejects relative paths
-5. **orbax-checkpoint==0.11.15** is the only version compatible with JAX 0.6.2
-6. **Use bfloat16 for 2B+ models on v6e-4** — float32 OOMs (31.25 GB HBM/chip)
-7. **Spot TPUs can be preempted anytime** — enable checkpointing for long runs
+5. **Multi-host: Orbax checkpoint needs shared filesystem (GCS)** — local paths deadlock
+6. **orbax-checkpoint==0.11.15** is the only version compatible with JAX 0.6.2
+7. **Use bfloat16 for 2B+ models on v6e-4** — float32 OOMs (31.25 GB HBM/chip)
+8. **Spot TPUs can be preempted anytime** — enable checkpointing for long runs
+9. **Always kill stale processes before re-launching training** — see troubleshooting.md
+10. **Never run gcloud SSH in background/subagent processes** — ssh-agent not inherited
 
 ## Decision Tree
 
@@ -92,7 +95,15 @@ User has TPU errors
 ├── "Failed to get global TPU topology"   → Wrong runtime (use v2-alpha-tpuv6e)
 ├── OOM / RESOURCE_EXHAUSTED              → Use bf16 + gradient checkpointing
 ├── SSH Connection timed out              → Firewall rules or use --tunnel-through-iap
+├── SSH exit code 255 (background)        → ssh-agent issue, see troubleshooting.md
 ├── orbax / checkpoint errors             → See troubleshooting.md
+├── Checkpoint deadlock in multi-host     → Use GCS path or bypass Orbax, see troubleshooting.md
 ├── XLA recompilation every step          → Pad all tensors to fixed shapes
 └── Other                                 → See troubleshooting.md
+
+Training crashed / need cleanup
+├── Kill stale processes                  → See troubleshooting.md "Cleaning Up"
+├── Clean .tmp checkpoint dirs            → See troubleshooting.md "Cleaning Up"
+├── Port 8476 still occupied              → Kill stale process, see troubleshooting.md
+└── Cannot SSH after crash                → Try IAP tunnel or delete/recreate TPU
 ```
