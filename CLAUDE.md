@@ -515,6 +515,25 @@ gcloud compute firewall-rules create allow-tpu-ssh-test \
     --source-ranges=0.0.0.0/0
 ```
 
+### 数据集准备
+
+LLaVA-Instruct-150K 数据集已缓存在 GCS，从 GCS 下载比从源站（HuggingFace + COCO）快得多：
+
+```bash
+# 从 GCS 下载（推荐，所有 worker 同时执行）
+gcloud compute tpus tpu-vm ssh VM_NAME --zone=ZONE --worker=all \
+    --command='mkdir -p ~/llava_data && gcloud storage cp -r gs://grhuang-02-vertex-ai/datasets/llava_data/* ~/llava_data/'
+
+# 训练时设置环境变量
+LLAVA_DATA_ROOT=~/llava_data DATASETS=llava_instruct_150k bash jax_qwenvl/scripts/train_tpu.sh
+```
+
+GCS 数据集路径：`gs://grhuang-02-vertex-ai/datasets/llava_data/`
+- `llava_instruct_150k.json` — 标注文件（157,712 样本）
+- `train2017/` — COCO train2017 图片（~118K 张）
+
+如需从源站重新下载：`bash jax_qwenvl/scripts/download_llava_data.sh ~/llava_data`
+
 ### 代码上传和环境准备
 
 ```bash
