@@ -147,6 +147,7 @@ Qwen3-VL/
 | `1b1f516` | 多机训练支持（v6e-16, 4 hosts），LLaVA 完整 1 epoch 验证 |
 | `dafa706` | Tensorboard GCS 定期同步 + 固定 orbax-checkpoint 版本 |
 | `7839edf` | 修复 Orbax async checkpoint 多机崩溃 + GCS 模型/checkpoint 自动上传 |
+| `512a846` | 修复多机 checkpoint 死锁（bypass Orbax）+ transformers 5.x 图片加载 + max_steps |
 
 ---
 
@@ -238,7 +239,7 @@ Qwen3-VL/
 2. **Batch 分片**：`position_ids` 特殊处理（shape `(3, B, L)`，batch 在 axis=1：`P(None, 'dp', None)`）
 3. **梯度累积**：`jax.lax.scan` 在 JIT 内循环累积，平均后 `apply_gradients`
 4. **梯度检查点**：`nn.remat(DecoderLayer, policy=nothing_saveable)` 和 `nn.remat(VisionBlock)`
-5. **Checkpoint**：Orbax `StandardSave`/`StandardRestore`，`enable_async_checkpointing=False`（多机 async 崩溃修复），支持 GCS 同步
+5. **Checkpoint**：单机用 Orbax `CheckpointManager`（sync 模式），多机用 process-0-only `flax.serialization`（Orbax 0.11.15 多机 barrier 死锁，需共享文件系统），支持 GCS 同步
 
 #### TrainingArguments 字段
 
@@ -571,7 +572,8 @@ huggingface_hub==0.30.x
 | OOM（float32 2B 模型） | `RESOURCE_EXHAUSTED` | 使用 bfloat16 + gradient checkpointing |
 | SSH 连接超时 | `Connection timed out` | 检查防火墙规则或使用 `--tunnel-through-iap` |
 | Checkpoint async 错误（单机） | `Array has been deleted` | 使用 `enable_async_checkpointing=False`（已默认禁用） |
-| Checkpoint async 错误（多机） | `cannot schedule new futures after shutdown` | 使用 `enable_async_checkpointing=False`（已默认禁用） |
+| Checkpoint 多机死锁 | `Timed out waiting for array_metadatas` 或 barrier hang | Orbax 0.11.15 多机需共享文件系统（GCS/NFS）。当前方案：bypass Orbax，process-0-only 用 flax.serialization 保存 |
+| transformers 5.x 图片加载 | `Incorrect padding` (base64 decode) | 在 `_build_messages()` 中用 `PIL.Image.open()` 预加载图片，不传路径字符串 |
 | XLA 每步重编译 | step time 不下降（60-100s/步） | 检查所有输入张量是否填充到固定形状 |
 | tokenizer model_max_length 过大 | 编译挂起或 OOM | 使用 training_args.model_max_length 而非 tokenizer 默认值 |
 
@@ -649,7 +651,10 @@ huggingface_hub==0.30.x
 
 7. **Spot TPU 随时可能被驱逐**：us-central1-b 多次被驱逐。建议开启 checkpoint 保存以支持断点续训
 
-8. **Orbax async checkpoint 在多机模式下崩溃**：`ckpt_manager.save(force=True)` 使用 async checkpointing 时，在 processes 1/2/3 上报 `RuntimeError: cannot schedule new futures after shutdown`，导致 checkpoint 卡在 `.orbax-checkpoint-tmp-0` 目录未 finalize。已通过 `enable_async_checkpointing=False` 修复
+8. **Orbax 0.11.15 多机 checkpoint 死锁**：Orbax 的 `CheckpointManager` 和 `StandardCheckpointer` 在多机模式下都会死锁。根本原因：Orbax 要求 checkpoint 目录对所有 host 可见（GCS 或 NFS），但本地路径 `~/output` 只有本机能看到。解决方案：
+   - **当前**：bypass Orbax，process-0-only 用 `jax.device_get()` + `flax.serialization.to_bytes()` 保存（DP 模式每个 host 有完整参数副本）
+   - **推荐长期方案**：使用 `gs://` 路径作为 Orbax checkpoint 目录（MaxText 的做法），这样所有 host 都能看到目录
+   - 多机 checkpoint 每次 ~11 GB，耗时 15-55 秒（msgpack 序列化 + 磁盘写入）
 
 9. **GCS 模型/checkpoint 自动上传**：通过 `--gcs_output_dir gs://bucket/path` 参数启用：
    - 每次 checkpoint 保存后自动同步到 `gs://.../path/<step>/`（仅 process 0）
