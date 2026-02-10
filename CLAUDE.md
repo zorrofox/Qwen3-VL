@@ -148,6 +148,7 @@ Qwen3-VL/
 | `dafa706` | Tensorboard GCS 定期同步 + 固定 orbax-checkpoint 版本 |
 | `7839edf` | 修复 Orbax async checkpoint 多机崩溃 + GCS 模型/checkpoint 自动上传 |
 | `512a846` | 修复多机 checkpoint 死锁（bypass Orbax）+ transformers 5.x 图片加载 + max_steps |
+| `21428c7` | Checkpoint 断点续训：re-shard restored state + 恢复 global_step + GCS 路径修复 |
 
 ---
 
@@ -576,6 +577,9 @@ huggingface_hub==0.30.x
 | transformers 5.x 图片加载 | `Incorrect padding` (base64 decode) | 在 `_build_messages()` 中用 `PIL.Image.open()` 预加载图片，不传路径字符串 |
 | XLA 每步重编译 | step time 不下降（60-100s/步） | 检查所有输入张量是否填充到固定形状 |
 | tokenizer model_max_length 过大 | 编译挂起或 OOM | 使用 training_args.model_max_length 而非 tokenizer 默认值 |
+| Checkpoint 恢复后 loss 跳回初始值 | restored state 未 re-shard 到 device mesh | 确保恢复后调用 `shard_params()` + `jax.device_put(opt_state, replicate)` |
+| GCS checkpoint 路径嵌套 | `gs://bucket/100/100/state.msgpack` | 使用 `cp -r src/* dst/` 而非 `cp -r src dst/` |
+| 多机恢复找不到 checkpoint | 其他 host 本地无文件 | 恢复前调用 `download_from_gcs()`（已自动集成） |
 
 ---
 
@@ -663,6 +667,58 @@ huggingface_hub==0.30.x
 
 ---
 
+## Checkpoint 断点续训
+
+### 修复的问题
+
+**日期**：2026-02-10
+**Commit**：`21428c7`
+
+| 问题 | 原因 | 修复 |
+|------|------|------|
+| `global_step` 恢复后从 0 开始 | `train.py` 硬编码 `global_step = 0`，未读取 `state.step` | 从 `state.step` 恢复 `global_step` |
+| 恢复的 state 未分片到 device mesh | `flax.serialization.from_bytes` 返回 numpy 数组，不在 TPU 上 | 恢复后 `shard_params()` + `jax.device_put(replicate)` |
+| GCS checkpoint 路径双重嵌套 | `gcloud storage cp -r /path/100 gs://bucket/100/` → `gs://bucket/100/100/state.msgpack` | 改为 `cp -r /path/100/* gs://bucket/100/` 上传目录内容 |
+| 多机恢复时其他 host 无 checkpoint | checkpoint 仅存在于 process 0 本地 + GCS | 新增 `download_from_gcs()` 方法，所有 host 在 restore 前从 GCS 下载 |
+| `train_tpu.sh` 无 resume 支持 | 缺少环境变量 | 新增 `RESUME_FROM_CHECKPOINT` 环境变量 |
+
+### 代码修改
+
+| 文件 | 变更 |
+|------|------|
+| `jax_qwenvl/train/checkpoint.py` | 修复 `_sync_to_gcs()` 路径嵌套（`src/*` 而非 `src`）+ 新增 `download_from_gcs()` 方法（扫描 GCS 最新 step → 下载到本地） |
+| `jax_qwenvl/train/train.py` | 恢复后 re-shard params（`shard_params`）+ replicate opt_state（`jax.device_put(x, NamedSharding(mesh, P()))`）+ 从 `state.step` 恢复 `global_step` + 恢复前调用 `download_from_gcs()` |
+| `jax_qwenvl/scripts/train_tpu.sh` | 新增 `RESUME_FROM_CHECKPOINT` 环境变量 |
+
+### 使用方法
+
+```bash
+# 从 GCS checkpoint 恢复训练，继续跑到 step 200
+RESUME_FROM_CHECKPOINT=True \
+MAX_STEPS=200 \
+SAVE_STEPS=10 \
+GCS_OUTPUT_DIR=gs://bucket/qwen3vl/model \
+bash jax_qwenvl/scripts/train_tpu.sh
+```
+
+### 恢复流程
+
+1. `CheckpointManager.download_from_gcs()` — 扫描 GCS 目录找最新 step，下载 `state.msgpack` 到本地（所有 host）
+2. `CheckpointManager.restore(state_template=state)` — 用 `flax.serialization.from_bytes` 反序列化（返回 numpy 数组）
+3. `shard_params(restored.params, mesh, rules)` — 将 params 放到 device mesh（DP 模式复制，FSDP 模式分片）
+4. `jax.device_put(opt_state, NamedSharding(mesh, P()))` — opt_state 复制到所有设备
+5. `global_step = int(state.step)` — 恢复训练步数计数器
+6. 训练循环从 `global_step` 继续，`max_steps` 控制总步数上限
+
+### 注意事项
+
+- **数据顺序**：恢复后数据从 epoch 开头重新迭代（deterministic seed），不会精确跟原训练对齐。optimizer state 正确恢复保证训练从正确的参数空间点继续
+- **`max_steps` 语义**：表示训练的**总步数上限**（包括已完成的步数），不是恢复后再跑的步数。从 step 100 恢复 + `max_steps=200` = 再跑 100 步
+- **GCS 路径**：`gcs_output_dir` 同时用于 checkpoint 上传和下载，确保恢复训练时使用与原训练相同的 GCS 路径
+- **单机兼容**：所有修改向后兼容单机模式。无 GCS 配置时 `download_from_gcs()` 为无操作
+
+---
+
 ## 下一步：待完成工作
 
 - MoE 模型支持（Expert Parallelism）
@@ -672,6 +728,7 @@ huggingface_hub==0.30.x
 - 多图/视频样本的固定形状填充（当前假设每样本最多 1 张图）
 - 混合 text-only + vision batch 支持（当前要求每个 batch 都有图片）
 - ~~多机 checkpoint 到 GCS~~（已完成：`gcs_output_dir` 参数支持 checkpoint + 模型自动上传）
+- ~~Checkpoint 断点续训~~（已完成：re-shard restored state + 恢复 global_step + GCS 下载 + 路径修复）
 - 视觉模型 DP 分片（当前视觉模型在所有设备上复制，浪费计算）
 
 ---
