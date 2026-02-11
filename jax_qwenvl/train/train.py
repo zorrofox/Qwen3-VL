@@ -362,8 +362,8 @@ def main():
     logger.info("Dataset loaded (%d samples) in %.1fs", len(dataset), _time.time() - _t0)
 
     dataset_size = len(dataset)
-    num_dp_devices = mesh.shape['dp']
-    batch_size = training_args.per_device_train_batch_size * num_dp_devices
+    num_data_devices = mesh.shape['fsdp'] if training_args.fsdp else mesh.shape['dp']
+    batch_size = training_args.per_device_train_batch_size * num_data_devices
 
     # Compute max vision tensor sizes for fixed-shape padding (avoids XLA recompilation)
     vision_cfg = config.vision_config
@@ -401,10 +401,10 @@ def main():
     if training_args.max_steps > 0:
         total_steps = min(total_steps, training_args.max_steps)
     logger.info(
-        "Dataset size=%d, per_device_batch=%d, num_dp_devices=%d, "
+        "Dataset size=%d, per_device_batch=%d, num_data_devices=%d, "
         "global_batch=%d, steps_per_epoch=%d, total_steps=%d",
         dataset_size, training_args.per_device_train_batch_size,
-        num_dp_devices, batch_size, steps_per_epoch, total_steps,
+        num_data_devices, batch_size, steps_per_epoch, total_steps,
     )
 
     # Compute warmup steps from ratio if needed
@@ -521,7 +521,7 @@ def main():
                     if len(micro_batch_buffer) == accum_steps:
                         # Stack micro-batches: each field gets leading dim of accum_steps
                         stacked = _stack_micro_batches(micro_batch_buffer)
-                        stacked = shard_batch(stacked, mesh)
+                        stacked = shard_batch(stacked, mesh, mode=sharding_mode)
 
                         # Compute token count before train_step (batch may be donated)
                         total_tokens = int(stacked.attention_mask.sum())
@@ -576,7 +576,7 @@ def main():
                 for batch_idx_list in batch_iter:
                     samples = [dataset[i] for i in batch_idx_list]
                     batch = collator(samples)
-                    batch = shard_batch(batch, mesh)
+                    batch = shard_batch(batch, mesh, mode=sharding_mode)
 
                     # Compute token count before train_step (batch may be donated)
                     total_tokens = int(batch.attention_mask.sum())
@@ -640,18 +640,21 @@ def main():
             except Exception as e:
                 logger.warning("Final checkpoint save failed: %s", e)
 
-        # Export weights to HuggingFace format (only on main process)
+        # Export weights to HuggingFace format
+        # All processes must call this (process_allgather is collective in FSDP)
         if is_main_process:
             logger.info("Exporting weights to HuggingFace safetensors format ...")
-            from jax_qwenvl.model.weight_exporter import export_hf_weights
-            export_hf_weights(
-                params=state.params,
-                output_dir=training_args.output_dir,
-                config=config,
-                lora_rank=lora_rank,
-                lora_alpha=lora_alpha,
-            )
+        from jax_qwenvl.model.weight_exporter import export_hf_weights
+        export_hf_weights(
+            params=state.params,
+            output_dir=training_args.output_dir,
+            config=config,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            is_main_process=is_main_process,
+        )
 
+        if is_main_process:
             # Save processor/tokenizer
             processor.save_pretrained(training_args.output_dir)
             logger.info("Processor saved to %s", training_args.output_dir)
