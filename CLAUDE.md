@@ -155,6 +155,7 @@ Qwen3-VL/
 | `8d4a002` | 修复多机 checkpoint resume opt_state sharding（v6e-16 验证通过） |
 | `204b57c` | GCS 上传改用 google-cloud-storage SDK，替代 gcloud CLI subprocess 调用 |
 | `f1f768a` | 修复最后一步 checkpoint 重复保存 warning + 恢复 gcsfs 依赖（Orbax 需要）|
+| `1d3425f` | 修复 FSDP batch 分片 + 多机 weight export（FSDP 2x faster than DP on v6e-16）|
 
 ---
 
@@ -944,6 +945,63 @@ Orbax checkpoint:    gcsfs → fsspec → etils   (Orbax 内部)
 
 ---
 
+## FSDP 模式修复与验证
+
+### 概述
+
+**日期**：2026-02-11
+**Commit**：`1d3425f`
+**环境**：TPU v6e-16 spot (us-central1-b)，4 hosts × 4 chips = 16 chips
+**数据集**：LLaVA-Instruct-150K
+**模型**：Qwen3-VL-2B-Instruct (bfloat16)
+**配置**：per_device_batch=4, global_batch=64, model_max_length=1024, max_pixels=50176
+
+### 修复的 Bug
+
+1. **`shard_batch()` 硬编码 `'dp'` 轴**：FSDP 模式下 `dp=1, fsdp=N`，`P('dp')` 等于 `P()`（复制），batch 从未被分片。修复：添加 `mode` 参数，FSDP 模式使用 `'fsdp'` 轴
+2. **`batch_size` 计算错误**：使用 `mesh.shape['dp']`（FSDP 下为 1），导致 global_batch=4 而非 64。修复：根据 mode 选择 `mesh.shape['fsdp']` 或 `mesh.shape['dp']`
+3. **`export_hf_weights` 多机死锁**：仅 process 0 调用，但 `process_allgather` 是集合操作需所有进程参与。修复：所有进程调用 `export_hf_weights`，通过 `is_main_process` 参数控制仅 process 0 写文件
+4. **`create_device_mesh` 缺 `fsdp=-1` 自动填充**：修复：添加 `elif fsdp == -1` 分支
+
+### 改动文件
+
+| 文件 | 变更 |
+|------|------|
+| `jax_qwenvl/train/sharding.py` | `shard_batch()` + `_shard_batch_multihost()` 添加 `mode` 参数；`create_device_mesh` 添加 `fsdp=-1` |
+| `jax_qwenvl/train/train.py` | `batch_size` 计算使用 `num_data_devices`；`shard_batch()` 传 `mode=sharding_mode`；`export_hf_weights` 所有进程调用 |
+| `jax_qwenvl/model/weight_exporter.py` | `_flatten_params` 添加 `process_allgather(v, tiled=True)` 处理 FSDP 分片数组；`export_hf_weights` 添加 `is_main_process` 参数 |
+
+### FSDP vs DP 对比（v6e-16, 16 chips）
+
+| 指标 | FSDP (`dp=1, fsdp=16`) | DP (`dp=16, fsdp=1`) |
+|------|----------------------|---------------------|
+| XLA 编译 (step 1) | 132s | 65s |
+| XLA 编译 (step 2) | 140s | 67s |
+| 稳态 step time | **0.35s** | 0.67s |
+| 稳态 throughput | **~49,000 tok/s** | ~25,000 tok/s |
+| avg_loss (20 步) | 1.6704 | 1.6697 |
+
+FSDP 模式稳态速度 **2x 于 DP 模式**。原因：每设备仅存储 1/16 参数和优化器状态，内存压力更低，XLA 可更高效分配计算资源。
+
+### 验证结果
+
+**Phase 1: FSDP 训练 20 步**
+- `Parameters sharded with mode=fsdp` ✓
+- `num_data_devices=16, global_batch=64` ✓
+- Checkpoint at step 10, 20 ✓
+- Weight export (safetensors) ✓
+- GCS upload (7 files) ✓
+
+**Phase 2: Checkpoint 恢复 (step 20→40)**
+- `Resumed from step 20` ✓
+- 训练从 step 21 继续到 step 40 ✓
+- Loss 连续性 ✓（未跳回初始值）
+- Checkpoint at step 30, 40 ✓
+- 旧 checkpoint (step 10) 自动删除 ✓ (`max_checkpoints=3`)
+- Weight export + GCS upload ✓
+
+---
+
 ## 下一步：待完成工作
 
 - MoE 模型支持（Expert Parallelism）
@@ -956,6 +1014,7 @@ Orbax checkpoint:    gcsfs → fsspec → etils   (Orbax 内部)
 - ~~Checkpoint 断点续训~~（已完成：re-shard restored state + 恢复 global_step + GCS 下载 + 路径修复）
 - ~~Orbax 原生 GCS checkpoint~~（已完成：删除 bypass 代码，Orbax 0.11.32 直接写 GCS，StandardRestore 自动 re-shard）
 - 视觉模型 DP 分片（当前视觉模型在所有设备上复制，浪费计算）
+- ~~FSDP 模式修复~~（已完成：batch 分片轴修复 + batch_size 计算修复 + 多机 weight export 修复，v6e-16 验证 FSDP 2x faster than DP）
 
 ---
 
