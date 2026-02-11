@@ -154,6 +154,7 @@ Qwen3-VL/
 | `ed78fc1` | Orbax 原生 GCS checkpoint：删除 bypass 代码，StandardRestore 自动 re-shard |
 | `8d4a002` | 修复多机 checkpoint resume opt_state sharding（v6e-16 验证通过） |
 | `204b57c` | GCS 上传改用 google-cloud-storage SDK，替代 gcloud CLI subprocess 调用 |
+| `f1f768a` | 修复最后一步 checkpoint 重复保存 warning + 恢复 gcsfs 依赖（Orbax 需要）|
 
 ---
 
@@ -629,6 +630,8 @@ orbax-checkpoint==0.11.15
 | tokenizer model_max_length 过大 | 编译挂起或 OOM | 使用 training_args.model_max_length 而非 tokenizer 默认值 |
 | Checkpoint 恢复后 loss 跳回初始值 | restored state 未正确放到 device mesh | Orbax `StandardRestore` 使用 template sharding 恢复大数组；opt_state 标量需 `_ensure_global()` 选择性 re-shard（已内置） |
 | Checkpoint resume 多机 `incompatible devices` | opt_state 标量（Adam count）在单 host 设备上 | `_ensure_global()` 检查 `len(x.devices()) == global_device_count`，不足的转 numpy + replicate（已内置） |
+| 最后一步 checkpoint 重复保存 | `Final checkpoint save failed: Checkpoint for step N already exists` | `max_steps` 恰好是 `save_steps` 的倍数时，训练循环已保存 checkpoint，post-loop 重复保存。已修复：检查 `latest_step() != global_step`（`f1f768a`） |
+| Orbax GCS checkpoint 报 `ImportError: gcsfs` | `Please install gcsfs to access Google Storage` | Orbax 通过 `etils/epath` → `fsspec` → `gcsfs` 访问 GCS 路径，需要 `gcsfs` 依赖（已加回 requirements.txt） |
 
 ---
 
@@ -885,13 +888,59 @@ bash jax_qwenvl/scripts/train_tpu.sh
 | `jax_qwenvl/utils/__init__.py` | 新增导出 `upload_files_to_gcs`, `sync_dir_to_gcs` |
 | `jax_qwenvl/train/train.py` | `_upload_to_gcs()` 改用 `upload_files_to_gcs()` 替代 subprocess |
 | `jax_qwenvl/train/metrics_logger.py` | `_sync_to_gcs()` 改用 `sync_dir_to_gcs()` 替代 gcloud/gsutil 双 fallback |
-| `jax_qwenvl/requirements.txt` | `gcsfs>=2024.0.0` → `google-cloud-storage>=2.19.0` |
+| `jax_qwenvl/requirements.txt` | 新增 `google-cloud-storage>=2.19.0`，保留 `gcsfs>=2024.0.0`（Orbax 依赖） |
+| `jax_qwenvl/train/train.py` | 修复最后一步 checkpoint 重复保存：检查 `latest_step() != global_step` |
 
-### 优势
+### GCS 依赖关系
 
-- **无外部 CLI 依赖**：不再需要 `gcloud` 或 `gsutil` 命令存在于 PATH 中
-- **更精细的错误信息**：SDK 抛出具体异常（`google.api_core.exceptions`）而非 `CalledProcessError`
-- **更轻量的依赖**：`google-cloud-storage` 比 `gcsfs`（依赖 fsspec + aiohttp）更精简
+```
+模型上传 / TB 同步:  google-cloud-storage SDK  (我们的代码)
+Orbax checkpoint:    gcsfs → fsspec → etils   (Orbax 内部)
+```
+
+- `google-cloud-storage`：用于 `_upload_to_gcs()`（模型文件）和 `_sync_to_gcs()`（tensorboard 日志），替代 gcloud/gsutil CLI
+- `gcsfs`：Orbax `CheckpointManager` 通过 `etils/epath` → `fsspec` → `gcsfs` 访问 GCS checkpoint 路径，不可移除
+
+### 验证结果
+
+**日期**：2026-02-11
+**Commit**：`204b57c`（SDK 迁移）、`f1f768a`（bug 修复 + gcsfs 恢复）
+**环境**：v6e-16 spot (us-central1-b)，4 hosts × 4 chips = 16 chips
+**数据集**：LLaVA-Instruct-150K
+**配置**：per_device_batch=4, global_batch=64, model_max_length=1024, max_pixels=50176
+
+#### Phase 1：训练 20 步 + GCS 上传
+
+| 指标 | 结果 |
+|------|------|
+| 训练 | 20 步完成，avg_loss=1.6586 |
+| Step time（稳态） | 0.65s |
+| Throughput | ~25,000-27,000 tokens/s |
+| Checkpoint step 10 | PASS — Orbax 原生写 GCS |
+| Checkpoint step 20 | PASS — Orbax 原生写 GCS |
+| 模型上传 | PASS — **7 files via google-cloud-storage SDK** |
+| TB 日志同步 | PASS — **1 file via google-cloud-storage SDK** |
+| Final checkpoint warning | 无（bug 已修复） |
+
+#### Phase 2：从 step 20 恢复 + 继续到 step 40
+
+| 指标 | 结果 |
+|------|------|
+| 恢复 | "Resumed from step 20" |
+| 训练 | step 21→40，avg_loss=1.5453 |
+| Loss 连续性 | 1.6218→1.5234（未跳回初始值） |
+| Checkpoint step 30/40 | PASS |
+| 模型上传 | PASS — **7 files via SDK** |
+| TB 日志同步 | PASS — **1 file via SDK** |
+| Final checkpoint warning | 无 |
+
+#### GCS Artifacts（`gs://grhuang-02-vertex-ai/qwen3-vl/`）
+
+| 路径 | 内容 |
+|------|------|
+| `*.safetensors` + `*.json` + `*.jinja` | 7 个模型文件（~7.9 GB） |
+| `checkpoints/20/`, `30/`, `40/` | Orbax tensorstore/zarr 格式 |
+| `tensorboard/` | 2 个 event 文件 |
 
 ---
 
