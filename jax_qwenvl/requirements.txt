@@ -30,3 +30,4 @@ torchvision>=0.25.0
 wandb>=0.24.0
 tensorboard>=2.20.0
 google-cloud-storage>=2.19.0  # GCS upload via native SDK
+gcsfs>=2024.0.0  # Required by Orbax/etils for GCS checkpoint paths

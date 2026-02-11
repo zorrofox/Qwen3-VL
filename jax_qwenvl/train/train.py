@@ -633,11 +633,12 @@ def main():
 
         # Wait for any pending checkpoint, then save final checkpoint
         ckpt_manager.wait_for_completion()
-        try:
-            ckpt_manager.save(global_step, state, force=True)
-            ckpt_manager.wait_for_completion()
-        except Exception as e:
-            logger.warning("Final checkpoint save failed: %s", e)
+        if ckpt_manager.latest_step() != global_step:
+            try:
+                ckpt_manager.save(global_step, state, force=True)
+                ckpt_manager.wait_for_completion()
+            except Exception as e:
+                logger.warning("Final checkpoint save failed: %s", e)
 
         # Export weights to HuggingFace format (only on main process)
         if is_main_process:
