@@ -236,25 +236,12 @@ def _upload_to_gcs(local_dir: str, gcs_dir: str):
 
     Skips checkpoint subdirectories (which are synced separately).
     """
-    import subprocess
+    from jax_qwenvl.utils.gcs import upload_files_to_gcs
 
-    gcs_dir = gcs_dir.rstrip("/") + "/"
-    uploaded = 0
-    for fname in os.listdir(local_dir):
-        fpath = os.path.join(local_dir, fname)
-        if not os.path.isfile(fpath):
-            continue
-        if not fname.endswith((".safetensors", ".json", ".jinja")):
-            continue
-        dst = gcs_dir + fname
-        try:
-            subprocess.run(
-                ["gcloud", "storage", "cp", fpath, dst],
-                check=True, capture_output=True, text=True,
-            )
-            uploaded += 1
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            logger.warning("Failed to upload %s to GCS: %s", fname, e)
+    uploaded = upload_files_to_gcs(
+        local_dir, gcs_dir,
+        extensions=(".safetensors", ".json", ".jinja"),
+    )
     logger.info("Model uploaded to %s (%d files)", gcs_dir, uploaded)
 
 

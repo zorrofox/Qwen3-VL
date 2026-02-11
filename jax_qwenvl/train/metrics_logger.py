@@ -110,38 +110,23 @@ class MetricsLogger:
     def _sync_to_gcs(self, cleanup: bool = True) -> None:
         """Copy local tensorboard event files to GCS.
 
-        Tries ``gcloud storage cp`` first, falling back to ``gsutil``.
-
         Args:
             cleanup: If True, remove the local temp directory after a
                 successful sync (used at ``finish()``).  If False, keep local
                 files so that subsequent events can still be appended (used for
                 periodic mid-training syncs).
         """
-        import subprocess
-        src = self._local_tb_dir.rstrip("/") + "/"
-        dst = self._gcs_tb_dir.rstrip("/") + "/"
-        logger.info("Syncing tensorboard logs: %s -> %s", src, dst)
+        from jax_qwenvl.utils.gcs import sync_dir_to_gcs
 
-        # Try gcloud storage first (more reliable on TPU VMs), then gsutil.
-        commands = [
-            ["gcloud", "storage", "cp", "-r", src + "*", dst],
-            ["gsutil", "-m", "cp", "-r", src, dst],
-        ]
-        for cmd in commands:
-            try:
-                subprocess.run(
-                    cmd, check=True, capture_output=True, text=True,
-                )
-                logger.info("Tensorboard logs synced to %s", dst)
-                if cleanup:
-                    shutil.rmtree(self._local_tb_dir, ignore_errors=True)
-                return
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                continue
-
-        logger.warning(
-            "Failed to sync tensorboard logs to GCS. "
-            "Local logs preserved at %s",
-            self._local_tb_dir,
-        )
+        logger.info("Syncing tensorboard logs: %s -> %s", self._local_tb_dir, self._gcs_tb_dir)
+        try:
+            uploaded = sync_dir_to_gcs(self._local_tb_dir, self._gcs_tb_dir)
+            logger.info("Tensorboard logs synced to %s (%d files)", self._gcs_tb_dir, uploaded)
+            if cleanup:
+                shutil.rmtree(self._local_tb_dir, ignore_errors=True)
+        except Exception as e:
+            logger.warning(
+                "Failed to sync tensorboard logs to GCS: %s. "
+                "Local logs preserved at %s",
+                e, self._local_tb_dir,
+            )
