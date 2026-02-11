@@ -30,6 +30,8 @@ def create_device_mesh(
 
     if dp == -1:
         dp = num_devices // (fsdp * tp)
+    elif fsdp == -1:
+        fsdp = num_devices // (dp * tp)
 
     assert dp * fsdp * tp == num_devices, (
         f"dp={dp} * fsdp={fsdp} * tp={tp} = {dp * fsdp * tp} "
@@ -114,15 +116,15 @@ _VISION_FIELDS = frozenset({
 })
 
 
-def shard_batch(batch, mesh: Mesh):
+def shard_batch(batch, mesh: Mesh, mode: str = 'dp'):
     """Shard a Batch's arrays onto the mesh for data parallelism.
 
     Supports both single-host and multi-host (TPU pod slice) configurations.
     In multi-host mode, uses ``host_local_array_to_global_array`` to assemble
     global arrays from each host's local shard.
 
-    - Text fields (batch dim on axis 0): DP-sharded.
-    - ``position_ids``: shape ``(3, B, L)`` -- DP-sharded on axis 1.
+    - Text fields (batch dim on axis 0): sharded on data axis.
+    - ``position_ids``: shape ``(3, B, L)`` -- sharded on axis 1.
     - Vision fields: replicated across all devices.
     - Scalars and None values are passed through unchanged.
 
@@ -131,6 +133,8 @@ def shard_batch(batch, mesh: Mesh):
               In multi-host mode, each host should provide the FULL batch
               (same data on all hosts, via deterministic shuffling).
         mesh: the device ``Mesh``.
+        mode: ``'dp'`` shards batch on the dp axis,
+              ``'fsdp'`` shards batch on the fsdp axis.
 
     Returns:
         Sharded batch with global arrays placed on the mesh.
@@ -139,12 +143,13 @@ def shard_batch(batch, mesh: Mesh):
     use_multihost = num_processes > 1
 
     if use_multihost:
-        return _shard_batch_multihost(batch, mesh)
+        return _shard_batch_multihost(batch, mesh, mode=mode)
 
-    # Single-host path (original)
-    dp_sharding = NamedSharding(mesh, P('dp'))
+    # Single-host path
+    data_axis = 'fsdp' if mode == 'fsdp' else 'dp'
+    dp_sharding = NamedSharding(mesh, P(data_axis))
     replicated = NamedSharding(mesh, P())
-    pos_sharding = NamedSharding(mesh, P(None, 'dp', None))
+    pos_sharding = NamedSharding(mesh, P(None, data_axis, None))
 
     def _shard_field(name, x):
         if x is None:
@@ -164,11 +169,11 @@ def shard_batch(batch, mesh: Mesh):
     return type(batch)(*sharded_values)
 
 
-def _shard_batch_multihost(batch, mesh: Mesh):
+def _shard_batch_multihost(batch, mesh: Mesh, mode: str = 'dp'):
     """Multi-host version of shard_batch.
 
     Each host provides the FULL batch. This function slices out each host's
-    local shard for DP-sharded fields, and passes vision fields in full
+    local shard for data-parallel fields, and passes vision fields in full
     (replicated).
 
     Uses ``jax.make_array_from_callback`` to create global arrays spanning
@@ -180,8 +185,9 @@ def _shard_batch_multihost(batch, mesh: Mesh):
     num_processes = jax.process_count()
     local_device_count = jax.local_device_count()
 
-    dp_pspec = P('dp')
-    pos_pspec = P(None, 'dp', None)
+    data_axis = 'fsdp' if mode == 'fsdp' else 'dp'
+    dp_pspec = P(data_axis)
+    pos_pspec = P(None, data_axis, None)
     replicated_pspec = P()
 
     def _shard_field(name, x):

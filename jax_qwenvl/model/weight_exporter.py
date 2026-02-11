@@ -87,6 +87,10 @@ def _flatten_params(
         if isinstance(v, dict):
             items.extend(_flatten_params(v, path))
         else:
+            # Handle FSDP-sharded arrays spanning multiple hosts
+            if hasattr(v, 'is_fully_addressable') and not v.is_fully_addressable:
+                from jax.experimental.multihost_utils import process_allgather
+                v = process_allgather(v, tiled=True)
             items.append((path, np.asarray(v)))
     return items
 
@@ -373,15 +377,20 @@ def export_hf_weights(
     lora_rank: int = 0,
     lora_alpha: float = 1.0,
     max_shard_size: int = 5 * 1024**3,  # 5 GB per shard
+    is_main_process: bool = True,
 ) -> None:
     """Export Flax parameters to HuggingFace safetensors format.
 
     Steps:
         1. If LoRA is active, merge ``base + A @ B * alpha/rank``.
-        2. Flatten the nested param dict.
+        2. Flatten the nested param dict (includes allgather for FSDP).
         3. Convert each Flax path to a PyTorch state-dict key.
         4. Apply reverse transpose.
         5. Save as safetensors (sharded if needed).
+
+    In multi-host FSDP mode, ALL processes must call this function so
+    that the collective ``process_allgather`` in step 2 can complete.
+    Only the main process writes files in steps 3-5.
 
     Args:
         params: nested Flax parameter dict (e.g. ``state.params``).
@@ -391,13 +400,19 @@ def export_hf_weights(
         lora_rank: LoRA rank; 0 means no LoRA.
         lora_alpha: LoRA scaling alpha.
         max_shard_size: maximum bytes per shard file.
+        is_main_process: if False, participate in allgather but skip
+            file writing.
     """
     # 1. Merge LoRA if needed
     if lora_rank > 0:
         params = merge_lora_params(params, lora_alpha=lora_alpha, lora_rank=lora_rank)
 
-    # 2. Flatten
+    # 2. Flatten (all processes must participate for process_allgather)
     flat = _flatten_params(params)
+
+    # Only main process writes files
+    if not is_main_process:
+        return
 
     # 3 & 4. Convert keys and transpose
     tensors: Dict[str, np.ndarray] = {}
