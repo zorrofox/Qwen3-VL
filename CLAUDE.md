@@ -36,6 +36,7 @@ Qwen3-VL/
 │   │   └── data_processor.py # Dataset + 2 个 Collator + 固定形状填充
 │   ├── utils/
 │   │   ├── __init__.py      # 公共 API 导出
+│   │   ├── gcs.py           # GCS 上传工具（google-cloud-storage SDK）
 │   │   └── vision_process.py # 图像/视频加载（无 torch 依赖）
 │   ├── model/
 │   │   ├── __init__.py      # 导出 Config, Model, load_hf_weights
@@ -152,6 +153,7 @@ Qwen3-VL/
 | `8500f81` | JAX 0.6.2 → 0.9.0 升级：Python 3.11+ venv，XLA 编译加速 35% |
 | `ed78fc1` | Orbax 原生 GCS checkpoint：删除 bypass 代码，StandardRestore 自动 re-shard |
 | `8d4a002` | 修复多机 checkpoint resume opt_state sharding（v6e-16 验证通过） |
+| `204b57c` | GCS 上传改用 google-cloud-storage SDK，替代 gcloud CLI subprocess 调用 |
 
 ---
 
@@ -671,7 +673,7 @@ orbax-checkpoint==0.11.15
 |------|------|
 | `jax_qwenvl/train/train.py` | `jax.distributed.initialize()`（try-except 包裹），`output_dir` 强制绝对路径，`is_main_process` 守卫日志/保存/导出，`logging_dir` 参数，`gcs_output_dir` 参数 + `_upload_to_gcs()` 训练后自动上传模型 |
 | `jax_qwenvl/train/sharding.py` | `shard_batch()` 自动检测多机（`process_count > 1`），`_shard_batch_multihost()` 使用 `host_local_array_to_global_array` |
-| `jax_qwenvl/train/metrics_logger.py` | 替换 `flax.metrics.tensorboard` 为 `torch.utils.tensorboard`，GCS 路径写入本地临时目录 + `finish()` 时 gsutil 同步 |
+| `jax_qwenvl/train/metrics_logger.py` | 替换 `flax.metrics.tensorboard` 为 `torch.utils.tensorboard`，GCS 路径写入本地临时目录 + `finish()` 时通过 google-cloud-storage SDK 同步 |
 | `jax_qwenvl/train/checkpoint.py` | Orbax `CheckpointManager` 直接指向 `gs://` 路径，原生多机协调，无手动 GCS 同步 |
 | `jax_qwenvl/scripts/train_tpu.sh` | 新增 `GCS_OUTPUT_DIR` 环境变量 |
 
@@ -698,13 +700,13 @@ orbax-checkpoint==0.11.15
    - `shard_batch()` 通过 `process_count() > 1` 自动切换路径
    - `MetricsLogger` 非主进程使用 `report_to="none"` 无操作
 
-6. **GCS tensorboard 不支持追加写入**：`torch.utils.tensorboard.SummaryWriter` 需要 `gcsfs`，但 GCS 不支持追加模式。解决方案：写入本地临时目录，训练结束后 gsutil 同步到 GCS
+6. **GCS tensorboard 不支持追加写入**：`torch.utils.tensorboard.SummaryWriter` 不支持 GCS 追加模式。解决方案：写入本地临时目录，定期和训练结束后通过 `google-cloud-storage` SDK 同步到 GCS
 
 7. **Spot TPU 随时可能被驱逐**：us-central1-b 多次被驱逐。建议开启 checkpoint 保存以支持断点续训
 
 8. **Orbax 原生 GCS checkpoint**：`--gcs_output_dir gs://bucket/path` 参数启用后，`CheckpointManager` 直接指向 `gs://.../path/checkpoints/`，所有 host 通过 GCS 读写 checkpoint，无需 `gcloud` CLI 或手动同步。Orbax 使用 tensorstore/zarr 格式（比 msgpack 更高效）
 
-9. **GCS 模型自动上传**：训练完成后自动上传 safetensors + json + jinja 模型文件到 `gcs_output_dir`（仅 process 0，使用 `gcloud storage cp`）
+9. **GCS 模型自动上传**：训练完成后自动上传 safetensors + json + jinja 模型文件到 `gcs_output_dir`（仅 process 0，使用 `google-cloud-storage` SDK）
 
 ---
 
@@ -863,6 +865,33 @@ bash jax_qwenvl/scripts/train_tpu.sh
 3. **多机协调**：所有 host 通过 GCS 直接读写，Orbax 内部处理同步，无需 `gcloud` CLI
 4. **恢复几乎无需 re-shard**：`StandardRestore` 使用 state template 的 sharding 恢复大数组（params、mu、nu）；仅 opt_state 标量需 `_ensure_global()` 选择性处理
 5. **公共 API 不变**：`save()`、`restore()`、`latest_step()`、`should_save()`、`wait_for_completion()` 接口和参数完全相同
+
+---
+
+## GCS 上传改用 google-cloud-storage SDK
+
+### 概述
+
+**日期**：2026-02-11
+**Commit**：`204b57c`
+
+训练后的模型上传（`train.py` 的 `_upload_to_gcs()`）和 tensorboard 日志同步（`metrics_logger.py` 的 `_sync_to_gcs()`）原先通过 `subprocess.run(["gcloud", "storage", "cp", ...])` 和 `subprocess.run(["gsutil", ...])` 调用外部 CLI。改为使用 `google-cloud-storage` Python SDK 原生上传，消除对外部 CLI 工具的依赖。
+
+### 改动
+
+| 文件 | 变更 |
+|------|------|
+| `jax_qwenvl/utils/gcs.py` | 新建：`upload_files_to_gcs(local_dir, gcs_uri, extensions)` 按扩展名过滤上传 + `sync_dir_to_gcs(local_dir, gcs_uri)` 全目录同步 |
+| `jax_qwenvl/utils/__init__.py` | 新增导出 `upload_files_to_gcs`, `sync_dir_to_gcs` |
+| `jax_qwenvl/train/train.py` | `_upload_to_gcs()` 改用 `upload_files_to_gcs()` 替代 subprocess |
+| `jax_qwenvl/train/metrics_logger.py` | `_sync_to_gcs()` 改用 `sync_dir_to_gcs()` 替代 gcloud/gsutil 双 fallback |
+| `jax_qwenvl/requirements.txt` | `gcsfs>=2024.0.0` → `google-cloud-storage>=2.19.0` |
+
+### 优势
+
+- **无外部 CLI 依赖**：不再需要 `gcloud` 或 `gsutil` 命令存在于 PATH 中
+- **更精细的错误信息**：SDK 抛出具体异常（`google.api_core.exceptions`）而非 `CalledProcessError`
+- **更轻量的依赖**：`google-cloud-storage` 比 `gcsfs`（依赖 fsspec + aiohttp）更精简
 
 ---
 
