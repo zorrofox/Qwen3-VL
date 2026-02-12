@@ -88,6 +88,7 @@ class TrainingArguments:
     gradient_accumulation_steps: int = 1
     gradient_checkpointing: bool = False
     fsdp: bool = False
+    fsdp_devices: int = 0  # FSDP axis device count (0=use fsdp bool logic; >0 enables explicit dp/fsdp split)
     max_checkpoints: int = 3
     resume_from_checkpoint: Optional[str] = None
     report_to: str = "none"
@@ -294,13 +295,22 @@ def main():
     logger.info("Processor loaded.")
 
     # 4. Create device mesh
-    if training_args.fsdp:
+    if training_args.fsdp_devices > 0:
+        mesh = create_device_mesh(dp=-1, fsdp=training_args.fsdp_devices)
+        if mesh.shape['dp'] > 1 and mesh.shape['fsdp'] > 1:
+            sharding_mode = 'hybrid'
+        elif mesh.shape['fsdp'] > 1:
+            sharding_mode = 'fsdp'
+        else:
+            sharding_mode = 'dp'
+    elif training_args.fsdp:
         mesh = create_device_mesh(dp=1, fsdp=-1)
         sharding_mode = 'fsdp'
     else:
         mesh = create_device_mesh(dp=-1, fsdp=1)
         sharding_mode = 'dp'
-    logger.info("Device mesh: %s (mode=%s)", mesh, sharding_mode)
+    logger.info("Device mesh: dp=%d, fsdp=%d (mode=%s)",
+                mesh.shape['dp'], mesh.shape['fsdp'], sharding_mode)
 
     # 5. Initialize model
     lora_rank = training_args.lora_rank if training_args.lora_enable else 0
@@ -362,7 +372,7 @@ def main():
     logger.info("Dataset loaded (%d samples) in %.1fs", len(dataset), _time.time() - _t0)
 
     dataset_size = len(dataset)
-    num_data_devices = mesh.shape['fsdp'] if training_args.fsdp else mesh.shape['dp']
+    num_data_devices = mesh.shape['dp'] * mesh.shape['fsdp']
     batch_size = training_args.per_device_train_batch_size * num_data_devices
 
     # Compute max vision tensor sizes for fixed-shape padding (avoids XLA recompilation)

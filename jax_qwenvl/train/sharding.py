@@ -47,7 +47,8 @@ def get_param_sharding_rules(mode: str = 'dp') -> dict:
 
     Args:
         mode: ``'dp'`` for pure data parallelism (all params replicated),
-              ``'fsdp'`` for fully-sharded (2-D params sharded on first axis).
+              ``'fsdp'`` for fully-sharded (2-D params sharded on first axis),
+              ``'hybrid'`` for mixed DP+FSDP (params sharded same as fsdp).
 
     Returns:
         Dict with keys ``'kernel'``, ``'embedding'``, ``'default_1d'``,
@@ -60,7 +61,7 @@ def get_param_sharding_rules(mode: str = 'dp') -> dict:
             'default_1d': P(),
             'default': P(),
         }
-    elif mode == 'fsdp':
+    elif mode in ('fsdp', 'hybrid'):
         return {
             'kernel': P('fsdp', None),
             'embedding': P('fsdp', None),
@@ -68,7 +69,7 @@ def get_param_sharding_rules(mode: str = 'dp') -> dict:
             'default': P(),
         }
     else:
-        raise ValueError(f"Unknown sharding mode: {mode!r} (expected 'dp' or 'fsdp')")
+        raise ValueError(f"Unknown sharding mode: {mode!r} (expected 'dp', 'fsdp', or 'hybrid')")
 
 
 def shard_params(params: dict, mesh: Mesh, rules: dict) -> dict:
@@ -134,7 +135,9 @@ def shard_batch(batch, mesh: Mesh, mode: str = 'dp'):
               (same data on all hosts, via deterministic shuffling).
         mesh: the device ``Mesh``.
         mode: ``'dp'`` shards batch on the dp axis,
-              ``'fsdp'`` shards batch on the fsdp axis.
+              ``'fsdp'`` shards batch on the fsdp axis,
+              ``'hybrid'`` shards batch on both dp and fsdp axes
+              (``P(('dp', 'fsdp'))``), total shards = dp × fsdp.
 
     Returns:
         Sharded batch with global arrays placed on the mesh.
@@ -146,7 +149,12 @@ def shard_batch(batch, mesh: Mesh, mode: str = 'dp'):
         return _shard_batch_multihost(batch, mesh, mode=mode)
 
     # Single-host path
-    data_axis = 'fsdp' if mode == 'fsdp' else 'dp'
+    if mode == 'hybrid':
+        data_axis = ('dp', 'fsdp')
+    elif mode == 'fsdp':
+        data_axis = 'fsdp'
+    else:
+        data_axis = 'dp'
     dp_sharding = NamedSharding(mesh, P(data_axis))
     replicated = NamedSharding(mesh, P())
     pos_sharding = NamedSharding(mesh, P(None, data_axis, None))
@@ -185,7 +193,12 @@ def _shard_batch_multihost(batch, mesh: Mesh, mode: str = 'dp'):
     num_processes = jax.process_count()
     local_device_count = jax.local_device_count()
 
-    data_axis = 'fsdp' if mode == 'fsdp' else 'dp'
+    if mode == 'hybrid':
+        data_axis = ('dp', 'fsdp')
+    elif mode == 'fsdp':
+        data_axis = 'fsdp'
+    else:
+        data_axis = 'dp'
     dp_pspec = P(data_axis)
     pos_pspec = P(None, data_axis, None)
     replicated_pspec = P()

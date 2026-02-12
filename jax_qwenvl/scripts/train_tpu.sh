@@ -64,6 +64,8 @@ RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 
 # FSDP (set to True for multi-device FSDP)
 FSDP="${FSDP:-False}"
+# FSDP_DEVICES: explicit FSDP axis size for hybrid DP+FSDP (0=use FSDP bool logic)
+FSDP_DEVICES="${FSDP_DEVICES:-0}"
 
 # LoRA
 LORA_ENABLE="${LORA_ENABLE:-False}"
@@ -117,6 +119,7 @@ python3 -m jax_qwenvl.train.train \
     --max_checkpoints "${MAX_CHECKPOINTS}" \
     --gradient_checkpointing "${GRADIENT_CHECKPOINTING}" \
     --fsdp "${FSDP}" \
+    --fsdp_devices "${FSDP_DEVICES}" \
     --lora_enable "${LORA_ENABLE}" \
     --lora_rank "${LORA_RANK}" \
     --lora_alpha "${LORA_ALPHA}" \

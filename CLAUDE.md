@@ -54,7 +54,7 @@ Qwen3-VL/
 │   │   ├── train_state.py    # 扩展 Flax TrainState
 │   │   ├── train_step.py     # @jax.jit train_step + 梯度累积
 │   │   ├── train.py          # 训练入口（参数解析、模型加载、训练循环）
-│   │   ├── sharding.py       # SPMD mesh + DP/FSDP 分片
+│   │   ├── sharding.py       # SPMD mesh + DP/FSDP/Hybrid 分片
 │   │   ├── checkpoint.py     # Orbax CheckpointManager 封装
 │   │   └── metrics_logger.py # wandb + tensorboard 统一日志
 │   └── scripts/
@@ -156,6 +156,7 @@ Qwen3-VL/
 | `204b57c` | GCS 上传改用 google-cloud-storage SDK，替代 gcloud CLI subprocess 调用 |
 | `f1f768a` | 修复最后一步 checkpoint 重复保存 warning + 恢复 gcsfs 依赖（Orbax 需要）|
 | `1d3425f` | 修复 FSDP batch 分片 + 多机 weight export（FSDP 2x faster than DP on v6e-16）|
+| (pending) | 混合 DP+FSDP 模式：`fsdp_devices` 参数，`mode='hybrid'`，`P(('dp','fsdp'))` batch 分片 |
 
 ---
 
@@ -243,7 +244,7 @@ Qwen3-VL/
 
 #### 关键实现
 
-1. **SPMD Mesh**：3 轴 `('dp', 'fsdp', 'tp')`，DP 模式参数全复制 `P()`，FSDP 模式 2D kernel 沿 fsdp 轴分片 `P('fsdp', None)`
+1. **SPMD Mesh**：3 轴 `('dp', 'fsdp', 'tp')`，DP 模式参数全复制 `P()`，FSDP/Hybrid 模式 2D kernel 沿 fsdp 轴分片 `P('fsdp', None)`，Hybrid 模式 batch 沿 `('dp', 'fsdp')` 双轴分片
 2. **Batch 分片**：`position_ids` 特殊处理（shape `(3, B, L)`，batch 在 axis=1：`P(None, 'dp', None)`）
 3. **梯度累积**：`jax.lax.scan` 在 JIT 内循环累积，平均后 `apply_gradients`
 4. **梯度检查点**：`nn.remat(DecoderLayer, policy=nothing_saveable)` 和 `nn.remat(VisionBlock)`
@@ -255,6 +256,7 @@ Qwen3-VL/
 gradient_accumulation_steps: int = 1    # micro-batch 累积数
 gradient_checkpointing: bool = False    # nn.remat 激活重算
 fsdp: bool = False                      # FSDP 模式（否则纯 DP）
+fsdp_devices: int = 0                  # FSDP 轴设备数（0=用 fsdp bool；>0 启用显式 dp/fsdp 分割，支持混合模式）
 max_checkpoints: int = 3               # 保留的 checkpoint 数量
 resume_from_checkpoint: Optional[str]   # checkpoint 恢复路径
 report_to: str = "none"                # "wandb", "tensorboard", "none"
@@ -1002,6 +1004,82 @@ FSDP 模式稳态速度 **2x 于 DP 模式**。原因：每设备仅存储 1/16 
 
 ---
 
+## 混合 DP+FSDP 模式
+
+### 概述
+
+**日期**：2026-02-12
+
+新增 `fsdp_devices` 参数，支持混合 DP+FSDP 并行模式（`mode='hybrid'`）。此前训练只支持纯 DP (`dp=N, fsdp=1`) 或纯 FSDP (`dp=1, fsdp=N`)。混合模式 (e.g. `dp=4, fsdp=4`) 将 FSDP 通信限制在 host 内高带宽 ICI 连接，跨 host 只做 DP 的 allreduce，适合大模型 (8B+) 在大 pod slice (v6e-64+) 上训练。
+
+### 三种并行模式
+
+| 模式 | 示例 (v6e-16) | 参数分片 | Batch 分片 | 适用场景 |
+|------|--------------|---------|-----------|---------|
+| DP | `dp=16, fsdp=1` | 全复制 `P()` | `P('dp')` | 小模型，每设备可放完整参数 |
+| FSDP | `dp=1, fsdp=16` | `P('fsdp', None)` | `P('fsdp')` | 大模型，需跨所有设备分片 |
+| Hybrid | `dp=4, fsdp=4` | `P('fsdp', None)` | `P(('dp', 'fsdp'))` | 大模型 + 大 pod，FSDP 限 host 内 |
+
+### 使用方法
+
+```bash
+# 混合模式：FSDP 在每 host 的 4 chips 内，DP 跨 4 hosts
+FSDP_DEVICES=4 bash jax_qwenvl/scripts/train_tpu.sh
+
+# 纯 FSDP（向后兼容）
+FSDP=True bash jax_qwenvl/scripts/train_tpu.sh
+
+# 纯 DP（向后兼容，默认）
+bash jax_qwenvl/scripts/train_tpu.sh
+```
+
+### `fsdp_devices` 参数优先级
+
+| 配置 | 结果 mesh | mode |
+|------|----------|------|
+| `fsdp_devices=4` on 16 devices | `dp=4, fsdp=4` | `hybrid` |
+| `fsdp_devices=16` on 16 devices | `dp=1, fsdp=16` | `fsdp` |
+| `fsdp_devices=1` on 16 devices | `dp=16, fsdp=1` | `dp` |
+| `fsdp_devices=0, fsdp=True` | `dp=1, fsdp=16` | `fsdp` |
+| `fsdp_devices=0, fsdp=False` | `dp=16, fsdp=1` | `dp` |
+
+### 改动文件
+
+| 文件 | 变更 |
+|------|------|
+| `jax_qwenvl/train/train.py` | 添加 `fsdp_devices: int = 0`；mesh 创建三分支逻辑；`num_data_devices = dp * fsdp`（统一公式） |
+| `jax_qwenvl/train/sharding.py` | `get_param_sharding_rules` 支持 `mode='hybrid'`（同 fsdp）；`shard_batch` / `_shard_batch_multihost` 支持 `mode='hybrid'` → `P(('dp','fsdp'))` |
+| `jax_qwenvl/scripts/train_tpu.sh` | 添加 `FSDP_DEVICES` 环境变量和 `--fsdp_devices` 传参 |
+
+### 关键设计
+
+1. **Batch 分片 `P(('dp', 'fsdp'))`**：JAX 标准语法，表示该维度同时在 dp 和 fsdp 两个轴上分片，总分片数 = dp_size × fsdp_size
+2. **参数分片与纯 FSDP 相同**：hybrid 模式下参数仍沿 fsdp 轴分片 `P('fsdp', None)`，dp 轴上每组独立复制
+3. **`num_data_devices = dp * fsdp`**：统一公式替代 if-else，对三种模式均正确（DP: N×1, FSDP: 1×N, Hybrid: M×K）
+4. **XLA 自动推导通信**：`train_step` 无需修改，XLA 从 PartitionSpec 自动推导：fsdp 组内 all-gather/reduce-scatter 参数，dp 组间 all-reduce 梯度
+
+### Checkpoint / Weight Export 兼容性
+
+| 组件 | hybrid 模式行为 | 是否改动 |
+|------|----------------|---------|
+| Checkpoint save | Orbax 序列化 `P('fsdp', None)` 数组，与纯 FSDP 相同 | 无 |
+| Checkpoint restore | `StandardRestore` 使用 template sharding，`_ensure_global()` 对任意 mesh 有效 | 无 |
+| Weight export | `fsdp=local_device_count` 时每 host 已有完整分片，跳过 `process_allgather`；fsdp 跨 host 时走 `process_allgather` | 无 |
+| train_step | XLA 自动插入 fsdp all-gather + dp all-reduce | 无 |
+
+### 推荐配置
+
+| TPU 类型 | 设备数 | hosts | 推荐 hybrid 配置 | 说明 |
+|----------|-------|-------|-----------------|------|
+| v6e-16 | 16 | 4×4 | `FSDP_DEVICES=4` → dp=4, fsdp=4 | FSDP 在 host 内，DP 跨 host |
+| v6e-32 | 32 | 8×4 | `FSDP_DEVICES=4` → dp=8, fsdp=4 | 同上 |
+| v6e-64 | 64 | 16×4 | `FSDP_DEVICES=4` → dp=16, fsdp=4 | 同上 |
+| v6e-64 | 64 | 16×4 | `FSDP_DEVICES=16` → dp=4, fsdp=16 | FSDP 跨 4 hosts（更大模型） |
+
+**原则**：`fsdp_devices` 设为每 host 的设备数（v6e 为 4），FSDP 通信限制在 host 内 ICI 高带宽连接。仅当模型太大无法放入单 host 时才增大 `fsdp_devices`。
+
+---
+
 ## 下一步：待完成工作
 
 - MoE 模型支持（Expert Parallelism）
@@ -1015,6 +1093,7 @@ FSDP 模式稳态速度 **2x 于 DP 模式**。原因：每设备仅存储 1/16 
 - ~~Orbax 原生 GCS checkpoint~~（已完成：删除 bypass 代码，Orbax 0.11.32 直接写 GCS，StandardRestore 自动 re-shard）
 - 视觉模型 DP 分片（当前视觉模型在所有设备上复制，浪费计算）
 - ~~FSDP 模式修复~~（已完成：batch 分片轴修复 + batch_size 计算修复 + 多机 weight export 修复，v6e-16 验证 FSDP 2x faster than DP）
+- ~~混合 DP+FSDP 模式~~（已完成：`fsdp_devices` 参数，`mode='hybrid'`，`P(('dp','fsdp'))` batch 分片，待 TPU 验证）
 
 ---
 
