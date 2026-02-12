@@ -156,7 +156,7 @@ Qwen3-VL/
 | `204b57c` | GCS 上传改用 google-cloud-storage SDK，替代 gcloud CLI subprocess 调用 |
 | `f1f768a` | 修复最后一步 checkpoint 重复保存 warning + 恢复 gcsfs 依赖（Orbax 需要）|
 | `1d3425f` | 修复 FSDP batch 分片 + 多机 weight export（FSDP 2x faster than DP on v6e-16）|
-| (pending) | 混合 DP+FSDP 模式：`fsdp_devices` 参数，`mode='hybrid'`，`P(('dp','fsdp'))` batch 分片 |
+| `5b83ef0` | 混合 DP+FSDP 模式：`fsdp_devices` 参数，`mode='hybrid'`，`P(('dp','fsdp'))` batch 分片 |
 
 ---
 
@@ -1078,6 +1078,36 @@ bash jax_qwenvl/scripts/train_tpu.sh
 
 **原则**：`fsdp_devices` 设为每 host 的设备数（v6e 为 4），FSDP 通信限制在 host 内 ICI 高带宽连接。仅当模型太大无法放入单 host 时才增大 `fsdp_devices`。
 
+### 验证结果
+
+**日期**：2026-02-12
+**环境**：TPU v6e-16 spot (us-central1-b)，4 hosts × 4 chips = 16 chips
+**数据集**：LLaVA-Instruct-150K
+**模型**：Qwen3-VL-2B-Instruct (bfloat16)
+**配置**：per_device_batch=4, global_batch=64, model_max_length=1024, max_pixels=50176
+
+#### 全部测试通过
+
+| 测试 | 配置 | 结果 | 验证项 |
+|------|------|------|--------|
+| Test 1: Hybrid 基本训练 | `FSDP_DEVICES=4`, 20 步 | PASS | mesh dp=4,fsdp=4 mode=hybrid, loss=1.6699, step_time=0.38s, ~45k tok/s, checkpoint+export+GCS |
+| Test 2: Hybrid 断点续训 | step 20→40 | PASS | 恢复正确, loss 连续 1.6695, 旧 checkpoint 自动删除 |
+| Test 3: FSDP 回归 | `FSDP=True`, 10 步 | PASS | mesh dp=1,fsdp=16 mode=fsdp, avg_loss=1.6598, checkpoint+export+GCS |
+| Test 4: DP 回归 | 默认, 10 步 | PASS | mesh dp=16,fsdp=1 mode=dp, step_time=0.67s, ~26k tok/s, checkpoint+export |
+| Test 5a: fsdp_devices=16 | 边界退化为 FSDP | PASS | mesh dp=1,fsdp=16 mode=fsdp, step_time=0.35s |
+| Test 5b: fsdp_devices=1 | 边界退化为 DP | PASS | mesh dp=16,fsdp=1 mode=dp, step_time=0.67s |
+| Test 6: 优先级测试 | `FSDP=True FSDP_DEVICES=4` | PASS | mesh dp=4,fsdp=4 mode=hybrid（fsdp_devices 优先） |
+
+#### 三种模式性能对比（v6e-16, 16 chips, Qwen3-VL-2B）
+
+| 模式 | Mesh | 稳态 Step Time | Throughput | XLA 编译 |
+|------|------|---------------|------------|---------|
+| DP | dp=16, fsdp=1 | 0.67s | ~26,000 tok/s | ~65s |
+| FSDP | dp=1, fsdp=16 | 0.35s | ~49,000 tok/s | ~133s |
+| **Hybrid** | dp=4, fsdp=4 | **0.38s** | **~45,000 tok/s** | ~65s |
+
+**分析**：Hybrid 模式稳态性能接近纯 FSDP（0.38s vs 0.35s），但 XLA 编译时间与 DP 一样快（65s vs 133s）。综合训练效率最优。
+
 ---
 
 ## 下一步：待完成工作
@@ -1093,7 +1123,7 @@ bash jax_qwenvl/scripts/train_tpu.sh
 - ~~Orbax 原生 GCS checkpoint~~（已完成：删除 bypass 代码，Orbax 0.11.32 直接写 GCS，StandardRestore 自动 re-shard）
 - 视觉模型 DP 分片（当前视觉模型在所有设备上复制，浪费计算）
 - ~~FSDP 模式修复~~（已完成：batch 分片轴修复 + batch_size 计算修复 + 多机 weight export 修复，v6e-16 验证 FSDP 2x faster than DP）
-- ~~混合 DP+FSDP 模式~~（已完成：`fsdp_devices` 参数，`mode='hybrid'`，`P(('dp','fsdp'))` batch 分片，待 TPU 验证）
+- ~~混合 DP+FSDP 模式~~（已完成：`fsdp_devices` 参数，`mode='hybrid'`，`P(('dp','fsdp'))` batch 分片，v6e-16 验证通过，7/7 测试全部 PASS）
 
 ---
 
