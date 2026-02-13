@@ -62,39 +62,6 @@ MAX_CHECKPOINTS="${MAX_CHECKPOINTS:-3}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-True}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 
-# When GCS_OUTPUT_DIR is set, mount GCS bucket via gcsfuse so weight export
-# writes directly to GCS instead of local disk (avoids "No space left" on TPU VMs).
-if [ -n "${GCS_OUTPUT_DIR}" ]; then
-    # Install gcsfuse if not present (v2-alpha-tpuv6e usually has it pre-installed)
-    if ! command -v gcsfuse &>/dev/null; then
-        sudo apt-get install -y -qq gcsfuse 2>/dev/null || \
-        (export GCSFUSE_REPO=gcsfuse-$(lsb_release -c -s) && \
-         echo "deb https://packages.cloud.google.com/apt $GCSFUSE_REPO main" | sudo tee /etc/apt/sources.list.d/gcsfuse.list && \
-         curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add - && \
-         sudo apt-get update -qq && sudo apt-get install -y -qq gcsfuse)
-    fi
-
-    # Parse bucket name and prefix from gs://bucket/path/to/dir
-    GCS_BUCKET=$(echo "${GCS_OUTPUT_DIR}" | sed 's|gs://||' | cut -d/ -f1)
-    GCS_PREFIX=$(echo "${GCS_OUTPUT_DIR}" | sed 's|gs://[^/]*/||')
-
-    # Mount the bucket to /mnt/gcs_output
-    MOUNT_DIR="/mnt/gcs_output"
-    if ! mountpoint -q "${MOUNT_DIR}" 2>/dev/null; then
-        sudo mkdir -p "${MOUNT_DIR}"
-        sudo gcsfuse --implicit-dirs "${GCS_BUCKET}" "${MOUNT_DIR}"
-        sudo chmod a+rw "${MOUNT_DIR}"
-        echo "Mounted gs://${GCS_BUCKET} at ${MOUNT_DIR}"
-    else
-        echo "GCS bucket already mounted at ${MOUNT_DIR}"
-    fi
-
-    # Override OUTPUT_DIR to point into the gcsfuse mount
-    OUTPUT_DIR="${MOUNT_DIR}/${GCS_PREFIX}"
-    mkdir -p "${OUTPUT_DIR}"
-    echo "OUTPUT_DIR overridden to ${OUTPUT_DIR} (gcsfuse)"
-fi
-
 # FSDP (set to True for multi-device FSDP)
 FSDP="${FSDP:-False}"
 # FSDP_DEVICES: explicit FSDP axis size for hybrid DP+FSDP (0=use FSDP bool logic)

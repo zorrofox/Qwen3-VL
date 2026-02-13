@@ -309,24 +309,41 @@ def _save_sharded(
     tensors: Dict[str, np.ndarray],
     output_dir: str,
     max_shard_size: int,
+    gcs_dir: Optional[str] = None,
 ) -> None:
     """Save tensors to one or more safetensors shards, plus an index JSON.
 
     If the total size fits in a single shard, saves as
     ``model.safetensors``.  Otherwise saves as
     ``model-00001-of-NNNNN.safetensors`` etc.
+
+    When *gcs_dir* is provided, each shard is written to a temporary file,
+    uploaded to GCS via the google-cloud-storage SDK, then deleted locally.
+    This avoids requiring enough local disk space for the entire model.
     """
+    import logging
+    import tempfile
     from safetensors.numpy import save_file
 
+    _logger = logging.getLogger(__name__)
+
     os.makedirs(output_dir, exist_ok=True)
+
+    # When streaming to GCS, write to a temp dir to avoid disk space issues
+    write_dir = tempfile.mkdtemp(prefix="hf_export_") if gcs_dir else output_dir
 
     # Compute total size
     total_bytes = sum(t.nbytes for t in tensors.values())
 
     if total_bytes <= max_shard_size:
         # Single file
-        path = os.path.join(output_dir, "model.safetensors")
+        filename = "model.safetensors"
+        path = os.path.join(write_dir, filename)
         save_file(tensors, path)
+        if gcs_dir:
+            from jax_qwenvl.utils.gcs import upload_file_to_gcs
+            upload_file_to_gcs(path, gcs_dir, filename)
+            os.remove(path)
         return
 
     # Shard
@@ -349,21 +366,33 @@ def _save_sharded(
     num_shards = len(shards)
     weight_map: Dict[str, str] = {}
 
+    if gcs_dir:
+        from jax_qwenvl.utils.gcs import upload_file_to_gcs
+
     for i, shard in enumerate(shards, 1):
         filename = f"model-{i:05d}-of-{num_shards:05d}.safetensors"
-        path = os.path.join(output_dir, filename)
+        path = os.path.join(write_dir, filename)
         save_file(shard, path)
         for key in shard:
             weight_map[key] = filename
+        if gcs_dir:
+            _logger.info("Uploading shard %d/%d to GCS ...", i, num_shards)
+            upload_file_to_gcs(path, gcs_dir, filename)
+            os.remove(path)
 
     # Write index
     index = {
         "metadata": {"total_size": total_bytes},
         "weight_map": weight_map,
     }
-    index_path = os.path.join(output_dir, "model.safetensors.index.json")
+    index_filename = "model.safetensors.index.json"
+    index_path = os.path.join(write_dir, index_filename)
     with open(index_path, "w") as f:
         json.dump(index, f, indent=2)
+    if gcs_dir:
+        upload_file_to_gcs(index_path, gcs_dir, index_filename)
+        os.remove(index_path)
+        os.rmdir(write_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +407,7 @@ def export_hf_weights(
     lora_alpha: float = 1.0,
     max_shard_size: int = 5 * 1024**3,  # 5 GB per shard
     is_main_process: bool = True,
+    gcs_dir: Optional[str] = None,
 ) -> None:
     """Export Flax parameters to HuggingFace safetensors format.
 
@@ -392,9 +422,14 @@ def export_hf_weights(
     that the collective ``process_allgather`` in step 2 can complete.
     Only the main process writes files in steps 3-5.
 
+    When *gcs_dir* is provided, safetensor shards are streamed directly
+    to GCS via the google-cloud-storage SDK, avoiding local disk space
+    requirements for large models.
+
     Args:
         params: nested Flax parameter dict (e.g. ``state.params``).
-        output_dir: directory to write safetensors files.
+        output_dir: directory to write safetensors files (used as
+            fallback when *gcs_dir* is not set).
         config: ``Qwen3VLConfig`` (unused currently but kept for
             forward-compatibility).
         lora_rank: LoRA rank; 0 means no LoRA.
@@ -402,6 +437,8 @@ def export_hf_weights(
         max_shard_size: maximum bytes per shard file.
         is_main_process: if False, participate in allgather but skip
             file writing.
+        gcs_dir: optional GCS URI (e.g. ``gs://bucket/path``). When
+            set, shards are uploaded directly to GCS and deleted locally.
     """
     # 1. Merge LoRA if needed
     if lora_rank > 0:
@@ -428,4 +465,4 @@ def export_hf_weights(
         tensors[pt_key] = array
 
     # 5. Save
-    _save_sharded(tensors, output_dir, max_shard_size)
+    _save_sharded(tensors, output_dir, max_shard_size, gcs_dir=gcs_dir)
