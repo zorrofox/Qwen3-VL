@@ -57,6 +57,24 @@ def upload_files_to_gcs(
     return uploaded
 
 
+def upload_file_to_gcs(local_path: str, gcs_uri: str, filename: str) -> None:
+    """Upload a single file to *gcs_uri*/*filename*.
+
+    Args:
+        local_path: absolute path to the local file.
+        gcs_uri: GCS destination directory (e.g. ``gs://bucket/prefix``).
+        filename: destination filename within *gcs_uri*.
+    """
+    from google.cloud import storage
+
+    client = storage.Client()
+    bucket_name, prefix = _parse_gcs_uri(gcs_uri)
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(prefix + filename)
+    blob.upload_from_filename(local_path)
+    logger.info("Uploaded %s -> gs://%s/%s", filename, bucket_name, blob.name)
+
+
 def sync_dir_to_gcs(local_dir: str, gcs_uri: str) -> int:
     """Upload all files in *local_dir* to *gcs_uri* (flat, no recursion).
 

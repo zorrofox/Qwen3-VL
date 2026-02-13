@@ -670,6 +670,7 @@ def main():
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             is_main_process=is_main_process,
+            gcs_dir=training_args.gcs_output_dir,
         )
 
         if is_main_process:
@@ -677,9 +678,16 @@ def main():
             processor.save_pretrained(training_args.output_dir)
             logger.info("Processor saved to %s", training_args.output_dir)
 
-            # Upload model files to GCS
+            # Upload remaining model files (json, jinja) to GCS
+            # (safetensors already uploaded by export_hf_weights when gcs_dir is set)
             if training_args.gcs_output_dir:
                 _upload_to_gcs(training_args.output_dir, training_args.gcs_output_dir)
+
+        # Sync all processes after export to prevent shutdown barrier timeout
+        # (process 0 may take minutes uploading large safetensors to GCS)
+        if jax.process_count() > 1:
+            from jax.experimental.multihost_utils import sync_global_devices
+            sync_global_devices("weight_export_done")
 
     metrics_logger.finish()
     logger.info("Training complete. Output dir: %s", training_args.output_dir)
