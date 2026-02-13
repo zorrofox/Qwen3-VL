@@ -157,6 +157,8 @@ Qwen3-VL/
 | `f1f768a` | 修复最后一步 checkpoint 重复保存 warning + 恢复 gcsfs 依赖（Orbax 需要）|
 | `1d3425f` | 修复 FSDP batch 分片 + 多机 weight export（FSDP 2x faster than DP on v6e-16）|
 | `5b83ef0` | 混合 DP+FSDP 模式：`fsdp_devices` 参数，`mode='hybrid'`，`P(('dp','fsdp'))` batch 分片 |
+| `20a8862` | 混合 DP+FSDP 验证结果文档化（7/7 测试全部通过 on v6e-16） |
+| `cd1c2d1` | 8B 模型 hybrid 验证：HF Hub 自动下载 + batched shard_params（0.69s/step, ~13k tok/s） |
 
 ---
 
@@ -585,8 +587,8 @@ Python==3.11.14 (venv on v2-alpha-tpuv6e)
 jax==0.9.0
 jaxlib==0.9.0
 libtpu==0.0.34
-flax==0.12.3
-optax==0.2.7
+flax==0.12.4
+optax==0.2.6
 orbax-checkpoint==0.11.32
 numpy==2.3.5
 scipy==1.17.0
