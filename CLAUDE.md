@@ -159,7 +159,7 @@ Qwen3-VL/
 | `5b83ef0` | 混合 DP+FSDP 模式：`fsdp_devices` 参数，`mode='hybrid'`，`P(('dp','fsdp'))` batch 分片 |
 | `20a8862` | 混合 DP+FSDP 验证结果文档化（7/7 测试全部通过 on v6e-16） |
 | `cd1c2d1` | 8B 模型 hybrid 验证：HF Hub 自动下载 + batched shard_params（0.69s/step, ~13k tok/s） |
-| `74fbb0f` | gcsfuse 挂载 GCS 解决 8B weight export 磁盘空间不足 |
+| `50b9f1b` | 8B weight export 修复：SDK 流式上传 + sync_global_devices 防止 shutdown barrier 超时 |
 
 ---
 
@@ -640,7 +640,8 @@ orbax-checkpoint==0.11.15
 | Orbax GCS checkpoint 报 `ImportError: gcsfs` | `Please install gcsfs to access Google Storage` | Orbax 通过 `etils/epath` → `fsspec` → `gcsfs` 访问 GCS 路径，需要 `gcsfs` 依赖（已加回 requirements.txt） |
 | TPU watchdog 超时（大模型分片） | `TpuSyncFlagReadCallbackWatchdog expired` | 8B+ 模型 `shard_params` 超过 60s 默认超时。改用 batched `jax.device_put(params, sharding_tree)` 替代逐叶 device_put |
 | HuggingFace Hub 模型 ID 找不到 | `FileNotFoundError: .../config.json` | `model_name_or_path` 是 Hub ID（如 `Qwen/Qwen3-VL-8B-Instruct`）而非本地路径。已修复：`train.py` 自动调用 `snapshot_download` |
-| Weight export 磁盘空间不足 | `I/O error: No space left on device` | 设置 `GCS_OUTPUT_DIR` 后 `train_tpu.sh` 自动用 gcsfuse 挂载 GCS bucket，export 直接写入 GCS（`74fbb0f`） |
+| Weight export 磁盘空间不足 | `I/O error: No space left on device` | 设置 `GCS_OUTPUT_DIR` 后 `_save_sharded` 逐 shard 写入临时文件 → SDK 上传 → 删除，无需本地磁盘空间（`50b9f1b`） |
+| Weight export shutdown barrier 超时 | `DEADLINE_EXCEEDED: Barrier timed out` (3/4 tasks reached) | 非主进程提前退出触发 5 分钟 shutdown barrier。已修复：export 后 `sync_global_devices("weight_export_done")` 同步所有进程（`50b9f1b`） |
 
 ---
 
@@ -1137,7 +1138,7 @@ bash jax_qwenvl/scripts/train_tpu.sh
 
 1. **Config/Weight 加载不支持 HuggingFace Hub 模型 ID**：`Qwen3VLConfig.from_pretrained()` 和 `load_hf_weights()` 都期望本地目录路径。2B 测试时使用预下载的本地路径，8B 测试时直接传 `Qwen/Qwen3-VL-8B-Instruct` 导致 `FileNotFoundError`。修复：在 `train.py` 中加入 `snapshot_download` 自动下载逻辑
 2. **TPU watchdog 超时**：8B 模型参数分片需要 ~325s，远超 TPU 默认 60s watchdog 超时。原 `shard_params` 逐叶调用 `jax.device_put`，长时间阻塞单线程。修复：改为构建 sharding pytree + 单次 batched `jax.device_put`，允许 JAX 内部优化传输
-3. **Weight export 磁盘空间不足**：8B 模型 safetensors ~16GB，超出 TPU VM 默认磁盘。训练和 checkpoint 正常完成，仅导出失败。已修复：`train_tpu.sh` 在 `GCS_OUTPUT_DIR` 设置时用 gcsfuse 挂载 GCS bucket，`OUTPUT_DIR` 指向挂载路径（`74fbb0f`）
+3. **Weight export 磁盘空间不足**：8B 模型 safetensors ~32GB（float32），超出 TPU VM 默认 100GB 磁盘。已修复：`_save_sharded` 逐 shard 写入临时文件 → `google-cloud-storage` SDK 上传 → 删除本地文件，+ `sync_global_devices` barrier 防止 shutdown timeout（`50b9f1b`）
 
 ### 训练结果
 
@@ -1193,47 +1194,72 @@ bash jax_qwenvl/scripts/train_tpu.sh
 
 ---
 
-## gcsfuse Weight Export 修复
+## 8B Weight Export 修复：SDK 流式上传
 
 ### 概述
 
 **日期**：2026-02-13
-**Commit**：`74fbb0f`
+**Commit**：`50b9f1b`
 
-8B 模型 weight export 失败（`No space left on device`），因为 TPU VM boot disk 固定 100GB，8B 模型 float32 safetensors ~32GB + HF 缓存 + 数据集 + venv 总共超 100GB。v6e-16 多主机不支持 Hyperdisk Balanced 读写挂载。
+8B 模型 weight export 失败（`No space left on device`），因为 TPU VM boot disk 固定 100GB，8B 模型 float32 safetensors ~32GB + HF 缓存 + 数据集 + venv 总共超 100GB。
 
-**解决方案**：当 `GCS_OUTPUT_DIR` 设置时，在 `train_tpu.sh` 中用 gcsfuse 将 GCS bucket 挂载为本地目录 `/mnt/gcs_output`，将 `OUTPUT_DIR` 指向挂载路径，export 直接写入 GCS。
+**尝试的方案**：
+
+1. ~~gcsfuse 挂载 GCS~~：写入速度太慢（~16 MB/s），32GB 需要 ~33 分钟，超过 JAX shutdown barrier 默认 5 分钟超时，进程被杀
+2. ~~SDK 流式上传（无 barrier）~~：每个 shard 写入临时文件后通过 `google-cloud-storage` SDK 上传到 GCS，但非主进程提前退出触发 shutdown barrier
+3. **SDK 流式上传 + `sync_global_devices` barrier**：在 export 完成后添加 `sync_global_devices("weight_export_done")` 同步点，所有进程等待主进程完成上传后再退出
 
 ### 改动文件
 
 | 文件 | 变更 |
 |------|------|
-| `jax_qwenvl/scripts/train_tpu.sh` | 添加 gcsfuse 安装 + 挂载逻辑：解析 `GCS_OUTPUT_DIR` 的 bucket/prefix，挂载到 `/mnt/gcs_output`，覆盖 `OUTPUT_DIR` |
+| `jax_qwenvl/model/weight_exporter.py` | `_save_sharded` 添加 `gcs_dir` 参数：写入临时文件 → SDK 上传 → 删除本地文件，逐 shard 流式处理 |
+| `jax_qwenvl/model/weight_exporter.py` | `export_hf_weights` 添加 `gcs_dir` 参数，传递给 `_save_sharded` |
+| `jax_qwenvl/train/train.py` | 传 `gcs_dir=training_args.gcs_output_dir` 给 `export_hf_weights`；添加 `sync_global_devices("weight_export_done")` barrier |
+| `jax_qwenvl/utils/gcs.py` | 新增 `upload_file_to_gcs(local_path, gcs_uri, filename)` 单文件上传 |
+| `jax_qwenvl/scripts/train_tpu.sh` | 移除 gcsfuse 挂载逻辑（不再需要） |
 
 ### 关键设计
 
-1. **仅在设置 `GCS_OUTPUT_DIR` 时挂载**：不影响无 GCS 配置的本地训练
-2. **整个 bucket 挂载 + 子路径**：gcsfuse 挂载整个 bucket，用 `GCS_PREFIX` 构造子目录路径
-3. **gcsfuse `--implicit-dirs`**：允许在 GCS 中创建不存在的目录结构
-4. **幂等挂载**：`mountpoint -q` 检查避免重复挂载
-5. **export 写入挂载路径**：`save_file(shard, path)` 写入 `/mnt/gcs_output/<prefix>/model-*.safetensors`，gcsfuse 自动同步到 GCS
-6. **processor.save_pretrained** 也写入挂载路径：tokenizer/config json 文件一起保存
-7. **checkpoint 不受影响**：Orbax 直接通过 gcsfs 写 GCS，不走 gcsfuse
-8. **无 Python 代码修改**：`export_hf_weights` 和 `processor.save_pretrained` 已写入 `output_dir`，仅需 shell 脚本覆盖路径
+1. **逐 shard 流式上传**：写入临时文件（~5GB/shard）→ `upload_file_to_gcs` 上传到 GCS → 删除本地文件。磁盘空间需求从 ~32GB 降到 ~5GB
+2. **`sync_global_devices` barrier**：export 完成后所有进程同步，防止非主进程提前退出触发 JAX shutdown barrier（5 分钟默认超时）
+3. **`_upload_to_gcs` 兼容**：safetensors 通过 `gcs_dir` 直接上传到 GCS，`_upload_to_gcs` 仅上传剩余的 JSON/jinja 文件（4 个，~11MB）
+4. **无 gcsfuse 依赖**：纯 SDK 上传，无需安装或挂载额外工具
+5. **向后兼容**：`gcs_dir=None` 时行为与原来完全一致（写入本地 `output_dir`）
 
-### 使用方法
+### 验证结果
 
-```bash
-# 设置 GCS_OUTPUT_DIR 即自动启用 gcsfuse 挂载
-GCS_OUTPUT_DIR=gs://bucket/qwen3vl-8b/model bash jax_qwenvl/scripts/train_tpu.sh
+**环境**：TPU v6e-16 spot (europe-west4-a)，4 hosts × 4 chips = 16 chips
+**模型**：Qwen3-VL-8B-Instruct (bfloat16)
+**配置**：per_device_batch=2, global_batch=32, FSDP_DEVICES=4 (hybrid dp=4, fsdp=4)
+
+| 指标 | 结果 |
+|------|------|
+| 训练 | 20 步，avg_loss=1.8565，0.69s/step，~13k tok/s |
+| **Weight export** | **7/7 shards (32.67 GiB) 上传到 GCS** |
+| 上传速度 | ~3 min/shard（~27 MB/s via SDK） |
+| 总上传时间 | ~20 分钟（7 shards + index.json） |
+| Processor 保存 | 4 files (tokenizer, config, jinja) 上传到 GCS |
+| 退出状态 | **exit code 0**（clean shutdown，无 barrier timeout） |
+
+### GCS 文件
+
 ```
-
-gcsfuse 挂载流程：
-1. 检测 gcsfuse 是否已安装（v2-alpha-tpuv6e 通常已预装）
-2. 从 `gs://bucket/path` 解析 bucket 名和 prefix
-3. 挂载 bucket 到 `/mnt/gcs_output`
-4. `OUTPUT_DIR` 覆盖为 `/mnt/gcs_output/path`
-5. 训练结束后 `export_hf_weights` 写入挂载路径 → 自动同步到 GCS
+gs://grhuang-02-vertex-ai/qwen3vl-8b-gcsfuse/
+├── model-00001-of-00007.safetensors  (4.82 GiB)
+├── model-00002-of-00007.safetensors  (4.84 GiB)
+├── model-00003-of-00007.safetensors  (4.95 GiB)
+├── model-00004-of-00007.safetensors  (4.97 GiB)
+├── model-00005-of-00007.safetensors  (4.83 GiB)
+├── model-00006-of-00007.safetensors  (4.84 GiB)
+├── model-00007-of-00007.safetensors  (3.40 GiB)
+├── model.safetensors.index.json
+├── chat_template.jinja
+├── processor_config.json
+├── tokenizer.json
+├── tokenizer_config.json
+└── checkpoints/                      (Orbax 原生 GCS)
+```
 
 ---
 
@@ -1252,7 +1278,7 @@ gcsfuse 挂载流程：
 - ~~FSDP 模式修复~~（已完成：batch 分片轴修复 + batch_size 计算修复 + 多机 weight export 修复，v6e-16 验证 FSDP 2x faster than DP）
 - ~~混合 DP+FSDP 模式~~（已完成：`fsdp_devices` 参数，`mode='hybrid'`，`P(('dp','fsdp'))` batch 分片，v6e-16 验证通过，7/7 测试全部 PASS）
 - ~~8B 模型 Hybrid DP+FSDP 验证~~（已完成：hybrid dp=4 fsdp=4，20+20 步训练+续训，0.69s/step ~13k tok/s）
-- ~~8B 模型 weight export 磁盘空间不足~~（已完成：gcsfuse 挂载 GCS bucket，export 直接写入 GCS，无需本地磁盘空间）
+- ~~8B 模型 weight export 磁盘空间不足~~（已完成：SDK 流式上传，逐 shard 写入临时文件 → 上传 GCS → 删除，+ `sync_global_devices` barrier 防 shutdown timeout）
 - HuggingFace Hub 模型自动下载（已完成：`snapshot_download` 在 `train.py` 中自动触发）
 - 大模型 shard_params 超时修复（已完成：batched `jax.device_put` 替代逐叶调用）
 
