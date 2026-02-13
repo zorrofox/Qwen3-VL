@@ -284,14 +284,22 @@ def main():
     )
     logger.info("Model: %s", model_args.model_name_or_path)
 
-    # 2. Load config
+    # 2. Resolve model path (download from HuggingFace Hub if needed)
+    model_path = model_args.model_name_or_path
+    if not os.path.isdir(model_path):
+        logger.info("Model path '%s' is not a local directory, downloading from HuggingFace Hub ...", model_path)
+        from huggingface_hub import snapshot_download
+        model_path = snapshot_download(model_path)
+        logger.info("Model downloaded to: %s", model_path)
+
+    # 3. Load config
     logger.info("Loading config ...")
-    config = Qwen3VLConfig.from_pretrained(model_args.model_name_or_path)
+    config = Qwen3VLConfig.from_pretrained(model_path)
     logger.info("Config loaded.")
 
-    # 3. Load processor/tokenizer
+    # 4. Load processor/tokenizer
     logger.info("Loading processor/tokenizer ...")
-    processor = AutoProcessor.from_pretrained(model_args.model_name_or_path)
+    processor = AutoProcessor.from_pretrained(model_path)
     logger.info("Processor loaded.")
 
     # 4. Create device mesh
@@ -325,9 +333,9 @@ def main():
     # 6. Load weights from HuggingFace safetensors
     import time as _time
     _t0 = _time.time()
-    logger.info("Loading weights from %s ...", model_args.model_name_or_path)
+    logger.info("Loading weights from %s ...", model_path)
     loaded = load_hf_weights(
-        model_args.model_name_or_path, config, lora_rank=lora_rank
+        model_path, config, lora_rank=lora_rank
     )
     params = loaded["params"]
     logger.info("Weights loaded in %.1fs", _time.time() - _t0)

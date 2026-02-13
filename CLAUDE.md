@@ -635,6 +635,9 @@ orbax-checkpoint==0.11.15
 | Checkpoint resume 多机 `incompatible devices` | opt_state 标量（Adam count）在单 host 设备上 | `_ensure_global()` 检查 `len(x.devices()) == global_device_count`，不足的转 numpy + replicate（已内置） |
 | 最后一步 checkpoint 重复保存 | `Final checkpoint save failed: Checkpoint for step N already exists` | `max_steps` 恰好是 `save_steps` 的倍数时，训练循环已保存 checkpoint，post-loop 重复保存。已修复：检查 `latest_step() != global_step`（`f1f768a`） |
 | Orbax GCS checkpoint 报 `ImportError: gcsfs` | `Please install gcsfs to access Google Storage` | Orbax 通过 `etils/epath` → `fsspec` → `gcsfs` 访问 GCS 路径，需要 `gcsfs` 依赖（已加回 requirements.txt） |
+| TPU watchdog 超时（大模型分片） | `TpuSyncFlagReadCallbackWatchdog expired` | 8B+ 模型 `shard_params` 超过 60s 默认超时。改用 batched `jax.device_put(params, sharding_tree)` 替代逐叶 device_put |
+| HuggingFace Hub 模型 ID 找不到 | `FileNotFoundError: .../config.json` | `model_name_or_path` 是 Hub ID（如 `Qwen/Qwen3-VL-8B-Instruct`）而非本地路径。已修复：`train.py` 自动调用 `snapshot_download` |
+| Weight export 磁盘空间不足 | `I/O error: No space left on device` | 8B 模型 safetensors ~16GB 超出 VM 磁盘。训练和 checkpoint 不受影响。解决方案：增大 VM 磁盘或实现流式 GCS 上传 |
 
 ---
 
@@ -1110,6 +1113,83 @@ bash jax_qwenvl/scripts/train_tpu.sh
 
 ---
 
+## 8B 模型 Hybrid DP+FSDP 验证
+
+### 概述
+
+**日期**：2026-02-13
+**环境**：TPU v6e-16 spot (us-central1-b)，4 hosts × 4 chips = 16 chips
+**数据集**：LLaVA-Instruct-150K
+**模型**：Qwen3-VL-8B-Instruct (bfloat16, ~8B params)
+**配置**：per_device_batch=2, global_batch=32, model_max_length=1024, max_pixels=50176, FSDP_DEVICES=4 (hybrid dp=4, fsdp=4)
+
+### 代码修改
+
+| 文件 | 变更 |
+|------|------|
+| `jax_qwenvl/train/train.py` | 添加 `huggingface_hub.snapshot_download` 自动下载：当 `model_name_or_path` 不是本地目录时，自动从 HuggingFace Hub 下载模型到 `~/.cache/huggingface/` |
+| `jax_qwenvl/train/sharding.py` | `shard_params` 改为 batched `jax.device_put`：先构建 sharding tree，再一次性 `jax.device_put(params, sharding_tree)`，避免逐叶 device_put 导致 TPU watchdog 超时（8B 模型 323s 分片时间超过 60s 默认超时） |
+
+### 发现的 Bug 及修复
+
+1. **Config/Weight 加载不支持 HuggingFace Hub 模型 ID**：`Qwen3VLConfig.from_pretrained()` 和 `load_hf_weights()` 都期望本地目录路径。2B 测试时使用预下载的本地路径，8B 测试时直接传 `Qwen/Qwen3-VL-8B-Instruct` 导致 `FileNotFoundError`。修复：在 `train.py` 中加入 `snapshot_download` 自动下载逻辑
+2. **TPU watchdog 超时**：8B 模型参数分片需要 ~325s，远超 TPU 默认 60s watchdog 超时。原 `shard_params` 逐叶调用 `jax.device_put`，长时间阻塞单线程。修复：改为构建 sharding pytree + 单次 batched `jax.device_put`，允许 JAX 内部优化传输
+3. **Weight export 磁盘空间不足**：8B 模型 safetensors ~16GB，超出 TPU VM 默认磁盘。训练和 checkpoint 正常完成，仅导出失败。需要更大磁盘或直接流式上传到 GCS
+
+### 训练结果
+
+#### Phase 1：训练 20 步
+
+| 指标 | 结果 |
+|------|------|
+| Mesh 日志 | `Device mesh: dp=4, fsdp=4 (mode=hybrid)` ✓ |
+| 模型下载 | HuggingFace Hub → `~/.cache/huggingface/` ✓ |
+| 参数分片 | `Parameters sharded with mode=hybrid in 325.0s` ✓ |
+| XLA 编译 (step 1) | 122s ✓ |
+| XLA 编译 (step 2) | 127s（第 2 次 trace）✓ |
+| 稳态 step time | **0.69s** ✓ |
+| 稳态 throughput | **~12,000-14,000 tok/s** |
+| Initial loss | 1.9276 |
+| avg_loss (20 步) | 1.8565 |
+| Checkpoint step 10, 20 | 保存到 GCS ✓（~32s/次）|
+| Weight export | FAIL — 磁盘空间不足（8B → ~16GB safetensors）|
+
+#### Phase 2：Checkpoint 恢复 (step 20→40)
+
+| 指标 | 结果 |
+|------|------|
+| Checkpoint 恢复 | `Checkpoint restored from step 20`，27.7s，1.76 GiB/s ✓ |
+| 训练续跑 | `Resumed from step 20`，`Resuming from global_step=20` ✓ |
+| 训练范围 | step 21 → step 40 ✓ |
+| Loss 连续性 | 1.9273 → 1.8357（未跳回初始值）✓ |
+| avg_loss (20 步) | 1.8569 |
+| Checkpoint step 30, 40 | 保存到 GCS ✓ |
+| Weight export | FAIL — 磁盘空间不足 |
+
+### 8B vs 2B 性能对比（Hybrid 模式，v6e-16）
+
+| 指标 | 2B hybrid | 8B hybrid | 比率 |
+|------|-----------|-----------|------|
+| Param sharding | ~5s | 325s | 65x（batched device_put） |
+| XLA 编译 (step 1) | ~65s | ~122s | 1.9x |
+| 稳态 step time | 0.38s | **0.69s** | 1.8x |
+| Throughput | ~45,000 tok/s | **~13,000 tok/s** | 0.29x |
+| Batch size (per device) | 4 | 2 | 0.5x |
+| Global batch | 64 | 32 | 0.5x |
+| Checkpoint save | ~32s | ~32s | 1.0x |
+| Checkpoint restore | — | 27.7s (1.76 GiB/s) | — |
+
+### 内存分析（实测）
+
+8B 模型在 hybrid dp=4, fsdp=4 配置下成功运行，验证了内存分析：
+- 每设备参数 (16GB / 4 fsdp) ≈ 4GB
+- Adam mu + nu ≈ 8GB
+- 梯度缓冲 ≈ 4GB
+- 激活（gradient checkpoint）≈ 1GB
+- 总计 ≈ 17GB / 31.25GB HBM — 内存充裕
+
+---
+
 ## 下一步：待完成工作
 
 - MoE 模型支持（Expert Parallelism）
@@ -1124,6 +1204,10 @@ bash jax_qwenvl/scripts/train_tpu.sh
 - 视觉模型 DP 分片（当前视觉模型在所有设备上复制，浪费计算）
 - ~~FSDP 模式修复~~（已完成：batch 分片轴修复 + batch_size 计算修复 + 多机 weight export 修复，v6e-16 验证 FSDP 2x faster than DP）
 - ~~混合 DP+FSDP 模式~~（已完成：`fsdp_devices` 参数，`mode='hybrid'`，`P(('dp','fsdp'))` batch 分片，v6e-16 验证通过，7/7 测试全部 PASS）
+- ~~8B 模型 Hybrid DP+FSDP 验证~~（已完成：hybrid dp=4 fsdp=4，20+20 步训练+续训，0.69s/step ~13k tok/s）
+- 8B 模型 weight export 磁盘空间不足（需要增大 VM 磁盘或流式上传到 GCS）
+- HuggingFace Hub 模型自动下载（已完成：`snapshot_download` 在 `train.py` 中自动触发）
+- 大模型 shard_params 超时修复（已完成：batched `jax.device_put` 替代逐叶调用）
 
 ---
 

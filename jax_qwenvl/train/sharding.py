@@ -84,7 +84,7 @@ def shard_params(params: dict, mesh: Mesh, rules: dict) -> dict:
         Parameter dict with each leaf placed on the mesh via
         ``jax.device_put``.
     """
-    def _get_sharding(path_tuple, value):
+    def _get_spec(path_tuple, value):
         path = '/'.join(str(p) for p in path_tuple)
         is_2d_plus = value.ndim >= 2
         is_kernel_like = (
@@ -105,9 +105,13 @@ def shard_params(params: dict, mesh: Mesh, rules: dict) -> dict:
             spec = rules.get('default_1d', rules['default'])
         else:
             spec = rules['default']
-        return jax.device_put(value, NamedSharding(mesh, spec))
+        return NamedSharding(mesh, spec)
 
-    return jax.tree_util.tree_map_with_path(_get_sharding, params)
+    # Build sharding tree first, then do a single batched device_put.
+    # This avoids per-leaf device_put calls that can trigger TPU watchdog
+    # timeouts for large models (8B+).
+    sharding_tree = jax.tree_util.tree_map_with_path(_get_spec, params)
+    return jax.device_put(params, sharding_tree)
 
 
 _VISION_FIELDS = frozenset({
