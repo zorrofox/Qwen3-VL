@@ -161,6 +161,7 @@ Qwen3-VL/
 | `cd1c2d1` | 8B 模型 hybrid 验证：HF Hub 自动下载 + batched shard_params（0.69s/step, ~13k tok/s） |
 | `50b9f1b` | 8B weight export 修复：SDK 流式上传 + sync_global_devices 防止 shutdown barrier 超时 |
 | `2aa753e` | CLAUDE.md 更新：8B 完整 1 epoch 训练结果（4928 步, avg_loss=1.7937, 32.67 GiB → GCS） |
+| `d164312` | 修复 tensorboard 日志未同步到 GCS：当 `gcs_output_dir` 设置时自动推导 `logging_dir` |
 
 ---
 
@@ -643,6 +644,7 @@ orbax-checkpoint==0.11.15
 | HuggingFace Hub 模型 ID 找不到 | `FileNotFoundError: .../config.json` | `model_name_or_path` 是 Hub ID（如 `Qwen/Qwen3-VL-8B-Instruct`）而非本地路径。已修复：`train.py` 自动调用 `snapshot_download` |
 | Weight export 磁盘空间不足 | `I/O error: No space left on device` | 设置 `GCS_OUTPUT_DIR` 后 `_save_sharded` 逐 shard 写入临时文件 → SDK 上传 → 删除，无需本地磁盘空间（`50b9f1b`） |
 | Weight export shutdown barrier 超时 | `DEADLINE_EXCEEDED: Barrier timed out` (3/4 tasks reached) | 非主进程提前退出触发 5 分钟 shutdown barrier。已修复：export 后 `sync_global_devices("weight_export_done")` 同步所有进程（`50b9f1b`） |
+| Tensorboard 日志未同步到 GCS | GCS 输出目录下无 `tensorboard/` 子目录 | `logging_dir` 未设置时回退到本地 `output_dir`，GCS 同步逻辑不触发。已修复：当 `gcs_output_dir` 设置时自动推导 `logging_dir = gcs_output_dir + "/tensorboard"`（`d164312`） |
 
 ---
 
@@ -1318,7 +1320,7 @@ gs://grhuang-02-vertex-ai/qwen3vl-8b-gcsfuse/
 |--------|------|
 | Checkpoint 保存 | 每 100 步自动保存到 GCS ✓（共 49 次保存） |
 | Checkpoint 保留 | max_checkpoints=5，最终保留 step 4600/4700/4800/4900/4928 ✓ |
-| Tensorboard | metrics 同步到 GCS ✓ |
+| Tensorboard | 未同步到 GCS（`logging_dir` 回退到本地路径，已在 `d164312` 修复） |
 | Weight export | 7/7 shards (32.67 GiB) 通过 SDK 流式上传到 GCS ✓ |
 | Processor 保存 | tokenizer + config + chat_template 上传到 GCS ✓ |
 | 退出状态 | exit code 0（clean shutdown，无 barrier timeout） ✓ |
