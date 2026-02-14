@@ -160,6 +160,7 @@ Qwen3-VL/
 | `20a8862` | 混合 DP+FSDP 验证结果文档化（7/7 测试全部通过 on v6e-16） |
 | `cd1c2d1` | 8B 模型 hybrid 验证：HF Hub 自动下载 + batched shard_params（0.69s/step, ~13k tok/s） |
 | `50b9f1b` | 8B weight export 修复：SDK 流式上传 + sync_global_devices 防止 shutdown barrier 超时 |
+| `2aa753e` | CLAUDE.md 更新：8B 完整 1 epoch 训练结果（4928 步, avg_loss=1.7937, 32.67 GiB → GCS） |
 
 ---
 
@@ -1263,6 +1264,109 @@ gs://grhuang-02-vertex-ai/qwen3vl-8b-gcsfuse/
 
 ---
 
+## 8B 模型完整 1 Epoch 训练
+
+### 概述
+
+**日期**：2026-02-14
+**环境**：TPU v6e-16 spot (us-central1-b)，4 hosts × 4 chips = 16 chips
+**数据集**：LLaVA-Instruct-150K（157,712 样本，COCO train2017）
+**模型**：Qwen3-VL-8B-Instruct (bfloat16, ~8B params)
+**配置**：per_device_batch=2, global_batch=32, model_max_length=1024, max_pixels=50176, FSDP_DEVICES=4 (hybrid dp=4, fsdp=4), gradient_checkpointing=True, save_steps=100, max_checkpoints=5
+
+### 训练结果
+
+完整 1 epoch 训练（4,928 步），总耗时 ~2.3 小时（含模型下载、分片、XLA 编译、训练、checkpoint、weight export）：
+
+| Step | Loss | Avg Loss | Step Time | Tokens/s |
+|------|------|----------|-----------|----------|
+| 1 | 1.9276 | 1.9276 | 121.38s | 64 (XLA 编译) |
+| 2 | 1.7993 | 1.8635 | 126.26s | 78 (第2次 trace) |
+| 3 | 1.8781 | 1.8684 | **0.69s** | **13,350** |
+| 100 | 1.8261 | 1.8567 | 0.69s | 12,782 |
+| 500 | 1.9963 | 1.8307 | 0.69s | 10,849 |
+| 1000 | 1.7658 | 1.8117 | 0.69s | 12,805 |
+| 1500 | 1.6954 | 1.8037 | 0.69s | 13,049 |
+| 2000 | 1.7256 | 1.7997 | 0.69s | 13,218 |
+| 2500 | 1.8518 | 1.7977 | 0.69s | 12,380 |
+| 3000 | 1.9062 | 1.7961 | 0.69s | 10,466 |
+| 3500 | 1.8041 | 1.7950 | 0.69s | 12,281 |
+| 4000 | 1.9185 | 1.7943 | 0.69s | 11,847 |
+| 4500 | 1.7272 | 1.7939 | 0.69s | 12,669 |
+| 4928 | 1.9313 | **1.7937** | 0.69s | 10,560 |
+
+### 汇总指标
+
+| 指标 | 值 |
+|------|-----|
+| 总步数 | 4,928 (1 epoch) |
+| 初始 loss | 1.9276 |
+| 最终 avg_loss | **1.7937** |
+| 稳态 step time | 0.69s |
+| 平均 throughput | ~12,500 tokens/s |
+| 训练时间（稳态步） | ~57 min |
+| XLA 编译时间（step 1-2） | ~248s |
+| 参数分片时间 | ~313s |
+| Checkpoint 保存时间 | ~35-41s/次 |
+| Weight export 时间 | ~8.5 min（7 shards, 32.67 GiB → GCS） |
+| 总 wall time（训练开始→完成） | ~2h 19min |
+| NaN/Inf | 无 |
+
+### Checkpoint 和 Weight Export
+
+| 检查项 | 结果 |
+|--------|------|
+| Checkpoint 保存 | 每 100 步自动保存到 GCS ✓（共 49 次保存） |
+| Checkpoint 保留 | max_checkpoints=5，最终保留 step 4600/4700/4800/4900/4928 ✓ |
+| Tensorboard | metrics 同步到 GCS ✓ |
+| Weight export | 7/7 shards (32.67 GiB) 通过 SDK 流式上传到 GCS ✓ |
+| Processor 保存 | tokenizer + config + chat_template 上传到 GCS ✓ |
+| 退出状态 | exit code 0（clean shutdown，无 barrier timeout） ✓ |
+
+### GCS 文件
+
+```
+gs://grhuang-02-vertex-ai/qwen3vl-8b-full-epoch/
+├── model-00001-of-00007.safetensors  (4.82 GiB)
+├── model-00002-of-00007.safetensors  (4.84 GiB)
+├── model-00003-of-00007.safetensors  (4.95 GiB)
+├── model-00004-of-00007.safetensors  (4.97 GiB)
+├── model-00005-of-00007.safetensors  (4.83 GiB)
+├── model-00006-of-00007.safetensors  (4.84 GiB)
+├── model-00007-of-00007.safetensors  (3.40 GiB)
+├── model.safetensors.index.json
+├── chat_template.jinja
+├── processor_config.json
+├── tokenizer.json
+├── tokenizer_config.json
+└── checkpoints/                      (Orbax 原生 GCS)
+    ├── 4600/
+    ├── 4700/
+    ├── 4800/
+    ├── 4900/
+    └── 4928/
+```
+
+### Loss 曲线分析
+
+8B 模型在 LLaVA-Instruct-150K 上的训练损失从 1.9276 下降到 avg_loss=1.7937，降幅 ~7%。与 2B 模型对比：
+
+| 指标 | 2B (v6e-16 DP, 2464 步) | 8B (v6e-16 Hybrid, 4928 步) |
+|------|------------------------|----------------------------|
+| 初始 loss | 1.6649 | 1.9276 |
+| 最终 avg_loss | 1.2727 | 1.7937 |
+| Loss 降幅 | 23.5% | 7.0% |
+| Global batch | 64 | 32 |
+| 数据量/epoch | 64 × 2464 = 157,696 | 32 × 4928 = 157,696 |
+| 稳态 step time | 0.68s | 0.69s |
+
+**注意**：8B 模型初始 loss 更高且收敛更慢，这是因为：
+1. 更大的模型需要更多训练步数才能充分收敛
+2. 单 epoch LLaVA 数据对 8B 模型来说数据量较少
+3. 默认学习率（1e-5）可能对 8B 模型偏保守
+
+---
+
 ## 下一步：待完成工作
 
 - MoE 模型支持（Expert Parallelism）
@@ -1281,6 +1385,7 @@ gs://grhuang-02-vertex-ai/qwen3vl-8b-gcsfuse/
 - ~~8B 模型 weight export 磁盘空间不足~~（已完成：SDK 流式上传，逐 shard 写入临时文件 → 上传 GCS → 删除，+ `sync_global_devices` barrier 防 shutdown timeout）
 - HuggingFace Hub 模型自动下载（已完成：`snapshot_download` 在 `train.py` 中自动触发）
 - 大模型 shard_params 超时修复（已完成：batched `jax.device_put` 替代逐叶调用）
+- ~~8B 模型完整 1 Epoch 训练~~（已完成：LLaVA-Instruct-150K 4928 步，avg_loss=1.7937，0.69s/step ~12.5k tok/s，32.67 GiB safetensors 上传到 GCS）
 
 ---
 
