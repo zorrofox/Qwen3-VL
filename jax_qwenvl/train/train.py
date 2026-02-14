@@ -432,6 +432,10 @@ def main():
         logger.info("Using warmup_ratio=%.3f -> warmup_steps=%d", training_args.warmup_ratio, warmup_steps)
 
     # Create metrics logger (only on main process to avoid duplicate writes)
+    # Auto-derive logging_dir from gcs_output_dir when not explicitly set
+    tb_logging_dir = training_args.logging_dir
+    if not tb_logging_dir and training_args.gcs_output_dir:
+        tb_logging_dir = training_args.gcs_output_dir.rstrip("/") + "/tensorboard"
     if is_main_process:
         metrics_logger = MetricsLogger(
             output_dir=training_args.output_dir,
@@ -448,7 +452,7 @@ def main():
                 "num_processes": num_processes,
                 "global_devices": jax.device_count(),
             },
-            logging_dir=training_args.logging_dir,
+            logging_dir=tb_logging_dir,
         )
     else:
         metrics_logger = MetricsLogger(
