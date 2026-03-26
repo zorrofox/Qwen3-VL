@@ -303,4 +303,5 @@ bash jax_qwenvl/scripts/train_tpu.sh
 - Pallas (JAX 自定义 TPU kernel): https://jax.readthedocs.io/en/latest/pallas/
 - Flax NNX: https://flax.readthedocs.io/en/latest/
 
-> 详细迁移历史、每步训练数据、各阶段验证结果请见 RESEARCH_LOG.md
+> 详细迁移历史、每步训练数据、各阶段验证结果请见 `jax_qwenvl/RESEARCH_LOG.md`
+> 功能路线图与下一步规划请见 `jax_qwenvl/ROADMAP.md`
