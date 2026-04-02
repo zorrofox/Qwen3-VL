@@ -62,21 +62,18 @@ def update_processor_pixels(processor, data_args):
         rank0_print(f"Updated image_processor min_pixels to {data_args.min_pixels}")
         rank0_print(f"Updated image_processor max_pixels to {data_args.max_pixels}")
 
-    if hasattr(ip, "size") and isinstance(ip.size, dict):
-        ip.size["shortest_edge"] = data_args.min_pixels
-        ip.size["longest_edge"] = data_args.max_pixels
-        rank0_print(
-            f"Updated image_processor size['shortest_edge'] to {data_args.min_pixels}"
-        )
-        rank0_print(
-            f"Updated image_processor size['longest_edge'] to {data_args.max_pixels}"
-        )
+    # Note: do NOT override ip.size["longest_edge"] / ip.size["shortest_edge"] here.
+    # Qwen3-VL image processor uses max_pixels/min_pixels as area constraints.
+    # size["longest_edge"] is an edge-length constraint (pixels, not area) and
+    # setting it to max_pixels (an area value) causes images to bypass resizing
+    # entirely (COCO images have max edge ~640px << max_pixels=50176).
 
     rank0_print("=== AFTER IMAGE PROCESSOR PARAMETERS ===")
     rank0_print(f"Image min_pixels: {getattr(ip, 'min_pixels', 'N/A')}")
     rank0_print(f"Image max_pixels: {getattr(ip, 'max_pixels', 'N/A')}")
-    rank0_print(f"Image size (shortest_edge): {ip.size.get('shortest_edge', 'N/A')}")
-    rank0_print(f"Image size (longest_edge):  {ip.size.get('longest_edge', 'N/A')}")
+    if hasattr(ip, "size") and isinstance(ip.size, dict):
+        rank0_print(f"Image size (shortest_edge): {ip.size.get('shortest_edge', 'N/A')}")
+        rank0_print(f"Image size (longest_edge):  {ip.size.get('longest_edge', 'N/A')}")
 
     # --- Video Processor ---
     if hasattr(processor, "video_processor") and processor.video_processor is not None:
@@ -116,15 +113,8 @@ def update_processor_pixels(processor, data_args):
             vp.fps = data_args.video_fps
             rank0_print(f"Updated video_processor fps to {data_args.video_fps}")
 
-        if hasattr(vp, "size") and isinstance(vp.size, dict):
-            vp.size["shortest_edge"] = data_args.video_min_pixels
-            vp.size["longest_edge"] = data_args.video_max_pixels
-            rank0_print(
-                f"Updated Video size (shortest_edge): {vp.size.get('shortest_edge', 'N/A')}"
-            )
-            rank0_print(
-                f"Updated Video size (longest_edge):  {vp.size.get('longest_edge', 'N/A')}"
-            )
+        # Note: do NOT override vp.size["longest_edge"] / vp.size["shortest_edge"].
+        # Same reason as image processor: video_max_pixels is area, not edge length.
 
         rank0_print("=== AFTER VIDEO PROCESSOR PARAMETERS ===")
         rank0_print(f"Video min_pixels: {getattr(vp, 'min_pixels', 'N/A')}")
@@ -140,7 +130,7 @@ def update_processor_pixels(processor, data_args):
     return processor
 
 
-def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any]]:
+def _build_messages(item: Dict[str, Any], base_path: Path, max_pixels: int = None) -> List[Dict[str, Any]]:
     # Extract and normalize images and videos
     images = item.get("image") or []
     if isinstance(images, str):
@@ -156,6 +146,17 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
     for img in images:
         img_path = _make_abs_paths(base_path, img)
         pil_img = PIL.Image.open(img_path).convert("RGB")
+        # Pre-resize to max_pixels area limit before passing to processor.
+        # apply_chat_template in transformers 5.x does not reliably respect
+        # image_processor.max_pixels, so we enforce the constraint here.
+        if max_pixels is not None:
+            w, h = pil_img.size
+            if w * h > max_pixels:
+                scale = (max_pixels / (w * h)) ** 0.5
+                pil_img = pil_img.resize(
+                    (max(1, int(w * scale)), max(1, int(h * scale))),
+                    PIL.Image.LANCZOS,
+                )
         image_pool.append({"type": "image", "image": pil_img})
     video_pool = [
         {"type": "video", "video": _make_abs_paths(base_path, vid)} for vid in videos
@@ -217,13 +218,14 @@ def _ensure_numpy(val):
 def preprocess_qwen_visual(
     sources,
     processor,
+    max_pixels: int = None,
 ) -> Dict:
     if len(sources) != 1:
         raise ValueError(f"Expected 1 source, got {len(sources)}")
 
     source = sources[0]
     base_path = Path(source.get("data_path", ""))
-    messages = _build_messages(source, base_path)
+    messages = _build_messages(source, base_path, max_pixels=max_pixels)
 
     full_result = processor.apply_chat_template(
         messages, tokenize=True, return_dict=True, return_tensors="pt"
@@ -421,6 +423,7 @@ class LazySupervisedDataset:
         data_dict = preprocess_qwen_visual(
             sources,
             self.processor,
+            max_pixels=getattr(self.data_args, "max_pixels", None),
         )
 
         seq_len = data_dict["input_ids"].shape[1]
