@@ -300,6 +300,15 @@ def main():
     # 4. Load processor/tokenizer
     logger.info("Loading processor/tokenizer ...")
     processor = AutoProcessor.from_pretrained(model_path)
+    # Apply max_pixels / min_pixels to the image processor so images are
+    # resized to the training resolution before tokenization.
+    ip = processor.image_processor
+    if hasattr(ip, "max_pixels"):
+        ip.max_pixels = data_args.max_pixels
+        logger.info("Set image_processor.max_pixels = %d", data_args.max_pixels)
+    if hasattr(ip, "min_pixels"):
+        ip.min_pixels = data_args.min_pixels
+        logger.info("Set image_processor.min_pixels = %d", data_args.min_pixels)
     logger.info("Processor loaded.")
 
     # 4. Create device mesh
@@ -386,7 +395,11 @@ def main():
     # Compute max vision tensor sizes for fixed-shape padding (avoids XLA recompilation)
     vision_cfg = config.vision_config
     merge_size = getattr(processor.image_processor, "merge_size", 2)
-    max_patches_per_image = data_args.max_pixels // (vision_cfg.patch_size ** 2)
+    # The ViT patch size is 14px for all Qwen2/2.5/3-VL models, but
+    # vision_cfg.patch_size may return a different value (e.g. 16).
+    # We use 14px and add a 50% buffer for tile-boundary rounding overhead.
+    VIT_PATCH_SIZE = 14
+    max_patches_per_image = int(data_args.max_pixels // (VIT_PATCH_SIZE ** 2) * 1.5)
     max_total_patches = batch_size * max_patches_per_image
     # Ensure divisible by merge_size² for PatchMerger reshape safety
     merge_sq = vision_cfg.spatial_merge_size ** 2

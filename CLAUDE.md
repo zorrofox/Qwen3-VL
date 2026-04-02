@@ -250,6 +250,8 @@ gcsfs>=2024.0.0             # Orbax 内部依赖，不可移除
 | transformers 5.x 图片加载 | `Incorrect padding` (base64 decode) | 用 `PIL.Image.open()` 预加载，不传路径字符串 |
 | Tensorboard 未同步到 GCS | GCS 下无 `tensorboard/` 子目录 | 设置 `GCS_OUTPUT_DIR` 后自动推导 `logging_dir`（`d164312`） |
 | SSH 连接超时 | `Connection timed out` | 检查防火墙规则或使用 `--tunnel-through-iap` |
+| 图片不被缩放，patches 远超预期 | `Actual patches XXXXX > max 6272` | transformers 5.x `apply_chat_template` 不走 `ip.max_pixels`；已在 `_build_messages` 加 PIL 预缩放（见修复说明） |
+| `max_total_patches` 计算偏小 | patches 错误上限导致 ValueError | `vision_cfg.patch_size=16` 与实际 ViT patch_size=14 不符；已修为 14px + 1.5x buffer |
 
 ---
 
@@ -277,6 +279,7 @@ bash jax_qwenvl/scripts/train_tpu.sh
 | 2B DP (dp=16) | v6e-16, 4h | 0.68s | ~25k tok/s | avg_loss=1.27 (2464 步) |
 | 2B Hybrid (dp=4, fsdp=4) | v6e-16 | 0.38s | ~45k tok/s | — |
 | 8B Hybrid (dp=4, fsdp=4) | v6e-16, 4h | 0.69s | ~13k tok/s | avg_loss=1.79 (4928 步) |
+| 8B Hybrid (dp=4, fsdp=4) | v6e-16 asia-ne1-b, 30步基准 | **0.78s** | **~12.4k tok/s** | avg_loss=1.82 |
 
 8B 内存占用（每设备）：参数 4GB + Adam 8GB + 梯度 4GB + 激活 1GB ≈ 17GB / 31.25GB HBM
 
