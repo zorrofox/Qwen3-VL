@@ -172,12 +172,7 @@ def shard_batch(batch, mesh: Mesh, mode: str = 'dp'):
         if name in _VISION_FIELDS:
             if os.environ.get('SHARD_VISION_BATCH', '0') == '1':
                 if name in ('image_cu_seqlens', 'video_cu_seqlens'):
-                    # For per_device_batch=1, we can bypass block-diagonal masking by
-                    # providing a single segment spanning all local patches.
-                    global_devices = jax.device_count()
-                    local_max = x[-1] // global_devices
-                    dummy = np.array([0, local_max], dtype=np.int32)
-                    return jax.device_put(dummy, replicated)
+                    return jax.device_put(x, replicated)
                 return jax.device_put(x, dp_sharding)
             return jax.device_put(x, replicated)
         if x.ndim >= 1:

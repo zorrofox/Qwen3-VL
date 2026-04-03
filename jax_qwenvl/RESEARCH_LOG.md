@@ -32,6 +32,7 @@
 | `50b9f1b` | 8B weight export 修复：SDK 流式上传 + sync_global_devices 防止 shutdown barrier 超时 |
 | `2aa753e` | CLAUDE.md 更新：8B 完整 1 epoch 训练结果（4928 步, avg_loss=1.7937, 32.67 GiB → GCS） |
 | `d164312` | 修复 tensorboard 日志未同步到 GCS：当 `gcs_output_dir` 设置时自动推导 `logging_dir` |
+| [Local] | ViT 视觉数据分片验证：对比 `SHARD_VISION_BATCH=1/0` 在 BS=1/2 下的性能与显存 |
 
 ---
 
@@ -339,3 +340,30 @@ Hybrid 关键设计：`P(('dp', 'fsdp'))` batch 分片；参数分片与纯 FSDP
 2B vs 8B 对比：8B 初始 loss 更高（1.93 vs 1.66），收敛更慢（降幅 7% vs 23.5%）；建议多 epoch 训练或更高学习率。
 
 GCS 输出（`gs://grhuang-02-vertex-ai/qwen3vl-8b-full-epoch/`）：7 safetensors + index.json + processor files + checkpoints/4600~4928
+
+---
+
+## ViT 视觉数据分片优化与验证（2026-04-03）
+
+**环境**：4-node TPU pod slice (16 chips), `MAX_PIXELS=345744`, LLaVA-Instruct-150K
+
+为了验证 ViT 视觉数据分片（`SHARD_VISION_BATCH`）的有效性，进行了对比实验：
+
+### 实验 1：Batch Size = 1 (每卡)
+
+| 模式 | `SHARD_VISION_BATCH` | 稳态 Step Time | Throughput | 备注 |
+|------|-----------------------|---------------|------------|------|
+| **分片** | 1 | 2.56s | ~3200 tok/s | 有效运行，受通信开销影响略慢 |
+| **全复制** | 0 | **1.98s** | **~4100 tok/s** | 小 Batch Size 下省去通信，速度更快 |
+
+### 实验 2：Batch Size = 2 (每卡)
+
+*   **分片模式 (`SHARD_VISION_BATCH=1`)**：触发 **OOM**（显存溢出）。
+    *   报错：`Used 41.37G of 31.25G hbm. Exceeded hbm capacity by 10.12G.`
+    *   分析：单个注意力矩阵 `bf16[16, 5292, 84672]` 占用达 13.3G，导致显存耗尽。
+*   **全复制模式 (`SHARD_VISION_BATCH=0`)**：未实际运行，但显存占用必然更高，同样会 OOM。
+
+**结论**：
+1.  ViT 数据分片代码有效，可正常运行。
+2.  在小 Batch Size (BS=1) 下，全复制模式由于没有跨节点通信，性能更优。
+3.  大分辨率 + 大 Batch Size 会导致显存急剧膨胀，需进一步优化显存（如降分辨率或增加重算）。

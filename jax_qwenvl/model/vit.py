@@ -201,7 +201,7 @@ class VisionAttention(nn.Module):
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
         # Build block-diagonal attention mask from cu_seqlens
-        attn_mask = _build_block_diagonal_mask(cu_seqlens, seq_len)
+        attn_mask = _build_block_diagonal_mask(cu_seqlens, seq_len, sharding_guide=hidden_states)
 
         # Scaled dot-product attention
         scaling = head_dim ** -0.5
@@ -234,6 +234,7 @@ class VisionAttention(nn.Module):
 def _build_block_diagonal_mask(
     cu_seqlens: jnp.ndarray,
     total_len: int,
+    sharding_guide: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     """Build a boolean block-diagonal mask from cumulative sequence lengths.
 
@@ -247,6 +248,10 @@ def _build_block_diagonal_mask(
         pair belongs to the same segment (attend).
     """
     pos = jnp.arange(total_len, dtype=jnp.int32)
+    if sharding_guide is not None and hasattr(sharding_guide, 'sharding'):
+        # Propagate sharding from hidden_states (usually sharded on axis 0)
+        pos = jax.lax.with_sharding_constraint(pos, sharding_guide.sharding)
+
     # segment_id[i] = how many cu_seqlens entries are <= i, minus 1
     belongs = (pos[:, None] >= cu_seqlens[None, :])  # (total_len, num_seg+1)
     segment_ids = jnp.sum(belongs.astype(jnp.int32), axis=-1) - 1  # (total_len,)

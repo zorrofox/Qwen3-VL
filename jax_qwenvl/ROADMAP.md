@@ -15,7 +15,7 @@
 | 断点续训 | 完整 |
 | **推理/生成** | **完全缺失** |
 | TP（张量并行） | mesh 占位但未实现 |
-| Vision 模型分片 | 未分片（全复制） |
+| Vision 模型分片 | 已完成 (支持分片/复制) |
 | 训练验证管道 | 未实现 |
 | Qwen2.5-VL 完整支持 | 权重格式已支持，架构未验证 |
 
@@ -81,15 +81,10 @@
 
 ---
 
-### P4：Vision 模型分片优化
+### P4：Vision 模型分片优化（已完成）
 
-**现状**：所有视觉数据（`pixel_values`、ViT 参数）在所有设备上**全复制**，`sharding.py` 第 166-172 行明确对所有 `_VISION_FIELDS` 使用 `replicated`。对 27 层 ViT encoder 浪费 HBM。
-
-**需实现**：
-- VisionModel 参数按 FSDP 轴分片（与 text model 统一）
-- Vision batch (`pixel_values`) 按数据轴分片
-
-**影响**：8B 模型中 ViT 参数约 0.6B，分片后每设备节省 ~1.2GB HBM（bfloat16）。
+**现状**：已实现 `SHARD_VISION_BATCH` 开关，支持视觉数据的分片与全复制。
+**验证**：于 2026-04-03 验证通过。小 Batch Size 下全复制更快，大 Batch Size 需配合分片（但当前分辨率下 BS=2 仍会 OOM，需进一步优化）。
 
 ---
 
@@ -130,3 +125,4 @@ P0 推理生成  →  P2 Qwen2.5-VL  →  P3 验证管道  →  P1 TP  →  P4 V
 - ✅ 8B 模型完整 1 epoch 训练验证（avg_loss=1.7937）
 - ✅ HF safetensors 权重导出（流式上传 GCS）
 - ✅ wandb + tensorboard 日志
+- ✅ ViT 视觉数据分片支持与性能验证（2026-04-03）

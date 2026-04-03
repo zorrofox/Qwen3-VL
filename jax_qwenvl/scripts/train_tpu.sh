@@ -78,7 +78,7 @@ echo "Datasets:   ${DATASETS}"
 echo "Output:     ${OUTPUT_DIR}"
 echo "Batch size: ${BATCH_SIZE} (accum: ${GRAD_ACCUM})"
 echo "LR:         ${LR}"
-echo "Devices:    $(timeout 5 python3 -c 'import jax; print(len(jax.devices()))' 2>/dev/null || echo 'unknown')"
+echo "Devices:    skipped"
 echo "=============================="
 
 EXTRA_ARGS=()
@@ -95,7 +95,7 @@ if [ -n "${RESUME_FROM_CHECKPOINT}" ]; then
     EXTRA_ARGS+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
 
-python3 -m jax_qwenvl.train.train \
+"${PYTHON_BIN:-python3}" -m jax_qwenvl.train.train \
     --model_name_or_path "${MODEL_PATH}" \
     --dataset_use "${DATASETS}" \
     --output_dir "${OUTPUT_DIR}" \
