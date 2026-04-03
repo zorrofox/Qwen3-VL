@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Optional
 
 import jax
+import os
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -169,6 +170,15 @@ def shard_batch(batch, mesh: Mesh, mode: str = 'dp'):
         if name == 'position_ids':
             return jax.device_put(x, pos_sharding)
         if name in _VISION_FIELDS:
+            if os.environ.get('SHARD_VISION_BATCH', '0') == '1':
+                if name in ('image_cu_seqlens', 'video_cu_seqlens'):
+                    # For per_device_batch=1, we can bypass block-diagonal masking by
+                    # providing a single segment spanning all local patches.
+                    global_devices = jax.device_count()
+                    local_max = x[-1] // global_devices
+                    dummy = np.array([0, local_max], dtype=np.int32)
+                    return jax.device_put(dummy, replicated)
+                return jax.device_put(x, dp_sharding)
             return jax.device_put(x, replicated)
         if x.ndim >= 1:
             return jax.device_put(x, dp_sharding)
@@ -219,6 +229,17 @@ def _shard_batch_multihost(batch, mesh: Mesh, mode: str = 'dp'):
             return host_local_array_to_global_array(local_x, mesh, pos_pspec)
 
         if name in _VISION_FIELDS:
+            if os.environ.get('SHARD_VISION_BATCH', '0') == '1':
+                if name in ('image_cu_seqlens', 'video_cu_seqlens'):
+                    global_devices = jax.device_count()
+                    local_max = x[-1] // global_devices
+                    dummy = np.array([0, local_max], dtype=np.int32)
+                    return host_local_array_to_global_array(dummy, mesh, replicated_pspec)
+                # Shard on data axis
+                B = x.shape[0]
+                local_B = B // num_processes
+                local_x = x[process_index * local_B : (process_index + 1) * local_B]
+                return host_local_array_to_global_array(local_x, mesh, dp_pspec)
             # Replicated: each host provides the full array
             return host_local_array_to_global_array(x, mesh, replicated_pspec)
 

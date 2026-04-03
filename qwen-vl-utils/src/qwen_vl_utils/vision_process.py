@@ -91,6 +91,9 @@ def to_rgb(pil_image: Image.Image) -> Image.Image:
 
 
 def fetch_image(ele: Dict[str, Union[str, Image.Image]], image_patch_size: int = 14) -> Image.Image:
+    print(f"DEBUG fetch_image ele keys: {ele.keys()}")
+    if "max_pixels" in ele:
+        print(f"DEBUG fetch_image max_pixels: {ele['max_pixels']}")
     if "image" in ele:
         image = ele["image"]
     else:
@@ -506,6 +509,7 @@ def process_vision_info(
 ) -> Tuple[Optional[List[Image.Image]], Optional[List[Union[torch.Tensor, List[Image.Image]]]], Optional[Dict[str, Any]]]:
 
     vision_infos = extract_vision_info(conversations)
+    print(f"DEBUG process_vision_info vision_infos: {vision_infos}")
     ## Read images or videos
     image_inputs = []
     video_inputs = []
