@@ -338,4 +338,52 @@ Hybrid 关键设计：`P(('dp', 'fsdp'))` batch 分片；参数分片与纯 FSDP
 
 2B vs 8B 对比：8B 初始 loss 更高（1.93 vs 1.66），收敛更慢（降幅 7% vs 23.5%）；建议多 epoch 训练或更高学习率。
 
+---
+
+## GKE v6e-16 验证（2026-04-05）
+
+首次在 GKE（非 GCE TPU VM）上验证训练，结果与 GCE 基准完全一致。
+
+### 集群配置
+
+| 项目 | 值 |
+|------|-----|
+| 集群 | tpu-v6e-cluster，asia-northeast1-b，GKE 1.32 |
+| 节点池 | ct6e-standard-4t × 4，4x4 拓扑，Spot |
+| 辅助节点 | n2-standard-4 × 1（default-pool） |
+
+### 验证结果（8B Hybrid, 30步基准）
+
+| 指标 | 值 |
+|------|-----|
+| step_time（稳态） | **0.78s** |
+| tokens/s | **~12.4k** |
+| avg_loss（30步） | **1.8243** |
+| XLA 编译（step 1-2） | ~160s |
+| 参数分片时间 | ~488s |
+
+与 GCE TPU VM 基准完全一致。
+
+### 踩坑记录
+
+**1. GCS 写权限 403**
+- 现象：Orbax CheckpointManager 初始化时写 GCS 报 `Provided scope(s) are not authorized`
+- 根因：GKE 节点 SA 默认 scope 只有 `deepstorage.read_only`
+- 解决：Workload Identity —— 集群启用 `--workload-pool`，节点池加 `--workload-metadata=GKE_METADATA`，创建 KSA 绑定到具有 objectAdmin 权限的 GSA
+
+**2. XLA 编译静默崩溃**
+- 现象：Sharding 完成后 5-26 分钟，所有 pod 静默崩溃（无 Python 异常，只有 JAX Shutdown barrier 错误）
+- 根因：容器默认 Python 3.12，与 `torch`（CPU-only）+ `libtpu` 共存时 XLA 编译层崩溃
+- 解决：在容器内创建 Python 3.11 venv，用 `pip install -r requirements.txt` 完整安装依赖
+
+**3. node selector 值**
+- 正确：`cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice`
+- 错误：`tpu-v6e-podslice`（GKE 文档示例，实际节点 label 不同）
+
+### Kubernetes 资源文件
+
+见 `jax_qwenvl/gke/`：
+- `verify-tpu-v6e-16.yaml`：TPU 设备验证 Job
+- `qwen3vl-8b-train-job.yaml`：8B 训练 Job（含 Workload Identity、Python 3.11、完整注释）
+
 GCS 输出（`gs://grhuang-02-vertex-ai/qwen3vl-8b-full-epoch/`）：7 safetensors + index.json + processor files + checkpoints/4600~4928

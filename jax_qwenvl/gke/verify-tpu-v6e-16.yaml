@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: headless-svc
+spec:
+  clusterIP: None
+  selector:
+    job-name: verify-tpu-v6e-16
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: verify-tpu-v6e-16
+spec:
+  backoffLimit: 0
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  template:
+    spec:
+      subdomain: headless-svc
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 4x4
+      containers:
+      - name: tpu-job
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest
+        command:
+        - bash
+        - -c
+        - |
+          python -c '
+          import jax
+          jax.distributed.initialize()
+          total = jax.device_count()
+          local = jax.local_device_count()
+          print(f"[Pod] local devices: {local}, total devices: {total}")
+          assert total == 16, f"Expected 16 TPU devices, got {total}"
+          print("PASS: all 16 TPU devices are available")
+          '
+        resources:
+          requests:
+            cpu: 10
+            memory: 407Gi
+            google.com/tpu: 4
+          limits:
+            cpu: 10
+            memory: 407Gi
+            google.com/tpu: 4

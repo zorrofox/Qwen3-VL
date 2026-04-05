@@ -85,10 +85,13 @@ Qwen3-VL/
 │   │   ├── sharding.py       # SPMD mesh + DP/FSDP/Hybrid 分片
 │   │   ├── checkpoint.py     # Orbax CheckpointManager（原生 GCS 多机支持）
 │   │   └── metrics_logger.py # wandb + tensorboard 统一日志
-│   └── scripts/
-│       ├── train_tpu.sh      # TPU 训练启动脚本
-│       ├── tpu_validate.py   # TPU 硬件验证脚本（8 项测试）
-│       └── download_llava_data.sh # LLaVA 数据集下载
+│   ├── scripts/
+│   │   ├── train_tpu.sh      # TPU 训练启动脚本
+│   │   ├── tpu_validate.py   # TPU 硬件验证脚本（8 项测试）
+│   │   └── download_llava_data.sh # LLaVA 数据集下载
+│   └── gke/                  # GKE 部署 Kubernetes 资源
+│       ├── verify-tpu-v6e-16.yaml   # TPU v6e-16 设备验证 Job（16 devices 可用性检测）
+│       └── qwen3vl-8b-train-job.yaml # 8B 模型训练 Job（已验证：0.78s/step，12.4k tok/s）
 ├── evaluation/              # 基准评测套件（VideoMME, MMMU, MathVision 等）
 ├── cookbooks/               # Jupyter 示例（OCR、grounding、agent 等）
 └── web_demo_mm.py           # Gradio Web 演示界面
@@ -280,6 +283,7 @@ bash jax_qwenvl/scripts/train_tpu.sh
 | 2B Hybrid (dp=4, fsdp=4) | v6e-16 | 0.38s | ~45k tok/s | — |
 | 8B Hybrid (dp=4, fsdp=4) | v6e-16, 4h | 0.69s | ~13k tok/s | avg_loss=1.79 (4928 步) |
 | 8B Hybrid (dp=4, fsdp=4) | v6e-16 asia-ne1-b, 30步基准 | **0.78s** | **~12.4k tok/s** | avg_loss=1.82 |
+| 8B Hybrid (dp=4, fsdp=4) | **GKE** v6e-16 asia-ne1-b, 30步基准 | **0.78s** | **~12.4k tok/s** | avg_loss=1.82 |
 
 8B 内存占用（每设备）：参数 4GB + Adam 8GB + 梯度 4GB + 激活 1GB ≈ 17GB / 31.25GB HBM
 
@@ -294,6 +298,83 @@ bash jax_qwenvl/scripts/train_tpu.sh
 - 多图/视频样本的固定形状填充（当前假设每样本最多 1 张图）
 - 混合 text-only + vision batch 支持（当前要求每个 batch 都有图片）
 - 视觉模型 DP 分片（当前视觉模型在所有设备上复制，浪费计算）
+
+---
+
+## GKE 上运行指南
+
+### 前提：Workload Identity 配置（必须，否则 GCS 写入 403）
+
+GKE pod 默认只有节点 SA 的 `deepstorage.read_only` scope，无法写入私有 GCS bucket。
+必须通过 **Workload Identity** 将 Kubernetes SA 绑定到具有 GCS 写权限的 Google SA。
+
+```bash
+PROJECT=$(gcloud config get-value project)
+GSA="tpu-trainer-sa@${PROJECT}.iam.gserviceaccount.com"
+
+# 1. 集群启用 Workload Identity
+gcloud container clusters update CLUSTER_NAME \
+  --location=LOCATION \
+  --workload-pool=${PROJECT}.svc.id.goog
+
+# 2. 节点池启用 GKE_METADATA（重建节点池时加此参数）
+#    --workload-metadata=GKE_METADATA
+
+# 3. 创建 Google SA 并授权
+gcloud iam service-accounts create tpu-trainer-sa --display-name="TPU Trainer SA"
+gcloud storage buckets add-iam-policy-binding gs://OUTPUT_BUCKET \
+  --member="serviceAccount:${GSA}" \
+  --role="roles/storage.objectAdmin"
+
+# 4. 创建 Kubernetes SA 并绑定
+kubectl create serviceaccount tpu-trainer-ksa
+gcloud iam service-accounts add-iam-policy-binding ${GSA} \
+  --role="roles/iam.workloadIdentityUser" \
+  --member="serviceAccount:${PROJECT}.svc.id.goog[default/tpu-trainer-ksa]"
+kubectl annotate serviceaccount tpu-trainer-ksa \
+  iam.gke.io/gcp-service-account=${GSA}
+
+# 5. Job spec 中指定
+#    serviceAccountName: tpu-trainer-ksa
+```
+
+### GKE 训练 Job 关键要点
+
+1. **必须使用 Python 3.11**：镜像默认 Python 3.12，与 JAX 0.9.0 + torch 混装会导致 XLA 编译静默崩溃。需在 pod 内建 Python 3.11 venv。
+2. **依赖安装用 requirements.txt**：手动挑包安装容易漏依赖，必须用 `pip install -r requirements.txt`。
+3. **node selector 用 `tpu-v6e-slice`**（非 `tpu-v6e-podslice`）：GKE 实际注入的 label 值。
+4. **数据集下载用 zip**：`train2017.zip` 比下载 118K 个文件快得多；用 Python `zipfile` 解压（容器无 `unzip`）。
+5. **headless Service 的 subdomain 必须与 Service name 一致**：GKE 据此自动生成 `TPU_WORKER_HOSTNAMES`。
+
+### GKE Pod 启动脚本模板
+
+```bash
+# 1. 下载代码
+mkdir -p /workspace && cd /workspace
+gcloud storage cp gs://BUCKET/code/jax_qwenvl.tar.gz .
+tar xzf jax_qwenvl.tar.gz
+
+# 2. 安装 Python 3.11 + 依赖
+apt-get update -qq && apt-get install -y -qq python3.11 python3.11-venv python3.11-dev
+python3.11 -m venv /opt/venv311 && source /opt/venv311/bin/activate
+pip install --quiet "jax[tpu]==0.9.0" \
+  -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+pip install --quiet -r jax_qwenvl/requirements.txt \
+  --extra-index-url https://download.pytorch.org/whl/cpu
+
+# 3. 下载数据集
+mkdir -p /data/llava
+gcloud storage cp gs://grhuang-02-vertex-ai/datasets/llava_data/llava_instruct_150k.json /data/llava/
+gcloud storage cp gs://grhuang-02-vertex-ai/datasets/llava_data/train2017.zip /data/llava/
+python3 -c "import zipfile; zipfile.ZipFile('/data/llava/train2017.zip').extractall('/data/llava/')"
+
+# 4. 训练（激活 venv）
+source /opt/venv311/bin/activate && cd /workspace
+MODEL_PATH=Qwen/Qwen3-VL-8B-Instruct DATASETS=llava_instruct_150k \
+LLAVA_DATA_ROOT=/data/llava BATCH_SIZE=2 FSDP_DEVICES=4 \
+GCS_OUTPUT_DIR=gs://BUCKET/output REPORT_TO=tensorboard \
+bash jax_qwenvl/scripts/train_tpu.sh
+```
 
 ---
 
