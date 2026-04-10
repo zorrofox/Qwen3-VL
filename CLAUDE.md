@@ -284,6 +284,7 @@ bash jax_qwenvl/scripts/train_tpu.sh
 | 8B Hybrid (dp=4, fsdp=4) | v6e-16, 4h | 0.69s | ~13k tok/s | avg_loss=1.79 (4928 步) |
 | 8B Hybrid (dp=4, fsdp=4) | v6e-16 asia-ne1-b, 30步基准 | **0.78s** | **~12.4k tok/s** | avg_loss=1.82 |
 | 8B Hybrid (dp=4, fsdp=4) | **GKE** v6e-16 asia-ne1-b, 30步基准 | **0.78s** | **~12.4k tok/s** | avg_loss=1.82 |
+| 8B Hybrid (dp=2, fsdp=8) | **GKE** v7x-16 us-central1-c, 30步基准 | **0.49s** | **~20k tok/s** | avg_loss=1.82 |
 
 8B 内存占用（每设备）：参数 4GB + Adam 8GB + 梯度 4GB + 激活 1GB ≈ 17GB / 31.25GB HBM
 
@@ -338,13 +339,28 @@ kubectl annotate serviceaccount tpu-trainer-ksa \
 #    serviceAccountName: tpu-trainer-ksa
 ```
 
-### GKE 训练 Job 关键要点
+### GKE 训练 Job 关键要点（v6e 与 v7x 通用）
 
 1. **必须使用 Python 3.11**：镜像默认 Python 3.12，与 JAX 0.9.0 + torch 混装会导致 XLA 编译静默崩溃。需在 pod 内建 Python 3.11 venv。
-2. **依赖安装用 requirements.txt**：手动挑包安装容易漏依赖，必须用 `pip install -r requirements.txt`。
-3. **node selector 用 `tpu-v6e-slice`**（非 `tpu-v6e-podslice`）：GKE 实际注入的 label 值。
+2. **依赖安装用 requirements.txt**：手动挑包安装容易漏依赖（如 torchvision），必须用 `pip install -r requirements.txt`。
+3. **node selector 用 `tpu-v6e-slice`（v6e）或 `tpu7x`（v7x）**：GKE 实际注入的 label 值。
 4. **数据集下载用 zip**：`train2017.zip` 比下载 118K 个文件快得多；用 Python `zipfile` 解压（容器无 `unzip`）。
 5. **headless Service 的 subdomain 必须与 Service name 一致**：GKE 据此自动生成 `TPU_WORKER_HOSTNAMES`。
+6. **模型从 GCS 下载（非 HuggingFace）**：v7x pod 网络无法访问 HF 的 Xet CDN（大文件下载挂起/中断）。预先 `snapshot_download` 到本机再上传 GCS，pod 启动时用 `gcloud storage cp -r` 拉取。已缓存：`gs://grhuang-02-vertex-ai/models/Qwen3-VL-8B-Instruct/qwen3vl-8b/`
+7. **v7x 多 host 必须创建 workload policy**：`gcloud beta compute resource-policies create workload-policy NAME --type=HIGH_THROUGHPUT --accelerator-topology=TOPOLOGY`；并在 nodeSelector 中指定 `cloud.google.com/placement-policy-name: NAME`。
+8. **v7x pod 不要请求 cpu/memory 资源**：`optimize-utilization-scheduler` 会据此注入错误的 `gke-nodepool: cpu-np` nodeSelector 导致调度失败；只请求 `google.com/tpu`。
+9. **v7x 每节点 8 JAX 设备**：`tpu7x-standard-4t` = 4 物理芯片 × 2 逻辑核 = 8 JAX devices/host；`tpu7x-16`（xpk命名）= 2 hosts × 8 = 16 JAX devices（"16卡"）。
+
+### v7x vs v6e 节点标签差异
+
+| 项目 | v6e-16 | tpu7x-16（"16卡"） |
+|------|--------|-----------------|
+| gke-tpu-accelerator | `tpu-v6e-slice` | `tpu7x` |
+| gke-tpu-topology | `4x4` | `2x2x2` |
+| placement-policy | 不需要 | **必须**（`gcloud beta compute resource-policies create workload-policy`） |
+| 节点数/completions | 4 | 2 |
+| 每节点 JAX devices | 4 | 8 |
+| 总 JAX devices | 16 | 16 |
 
 ### GKE Pod 启动脚本模板
 
