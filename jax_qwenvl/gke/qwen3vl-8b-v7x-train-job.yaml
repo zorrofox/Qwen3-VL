@@ -123,21 +123,21 @@ spec:
           echo "=== [$(date)] Dataset ready ==="
 
           # 5. 训练（模型从本地 GCS 副本加载，跳过 HuggingFace 下载）
-          # FSDP_DEVICES=8：每 host 内 8 个 JAX dev 做 FSDP，2 hosts 之间做 DP
-          # 等效于 v6e-16 的 FSDP_DEVICES=4 配置（每 host FSDP，多 host DP）
+          # FSDP_DEVICES=4：与 v6e-16 完全相同的 dp=4,fsdp=4 mesh（验证 checkpoint 是否正常）
+          # 注：v7x 每 host 8 JAX dev，fsdp=4 会跨 host 边界，但 Orbax 2-process allgather 有 bug
           source /opt/venv311/bin/activate
           cd /workspace
           MODEL_PATH=/workspace/model/qwen3vl-8b \
           DATASETS=llava_instruct_150k \
           LLAVA_DATA_ROOT=/data/llava \
           BATCH_SIZE=2 \
-          FSDP_DEVICES=8 \
+          FSDP_DEVICES=4 \
           MAX_STEPS=30 \
           MAX_PIXELS=50176 \
           GCS_OUTPUT_DIR=gs://grhuang-02-vertex-ai/qwen3vl-8b-v7x-test \
           REPORT_TO=tensorboard \
-          RUN_NAME=qwen3vl-8b-v7x16-bench \
-          SAVE_STEPS=9999 \
+          RUN_NAME=qwen3vl-8b-v7x16-fsdp4-bench \
+          SAVE_STEPS=30 \
           bash jax_qwenvl/scripts/train_tpu.sh
 
         env:

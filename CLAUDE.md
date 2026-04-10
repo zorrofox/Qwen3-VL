@@ -284,7 +284,7 @@ bash jax_qwenvl/scripts/train_tpu.sh
 | 8B Hybrid (dp=4, fsdp=4) | v6e-16, 4h | 0.69s | ~13k tok/s | avg_loss=1.79 (4928 步) |
 | 8B Hybrid (dp=4, fsdp=4) | v6e-16 asia-ne1-b, 30步基准 | **0.78s** | **~12.4k tok/s** | avg_loss=1.82 |
 | 8B Hybrid (dp=4, fsdp=4) | **GKE** v6e-16 asia-ne1-b, 30步基准 | **0.78s** | **~12.4k tok/s** | avg_loss=1.82 |
-| 8B Hybrid (dp=2, fsdp=8) | **GKE** v7x-16 us-central1-c, 30步基准 | **0.49s** | **~20k tok/s** | avg_loss=1.82 |
+| 8B Hybrid (dp=4, fsdp=4) | **GKE** v7x-16 us-central1-c, 30步基准 | **0.49s** | **~20k tok/s** | avg_loss=1.83 |
 
 8B 内存占用（每设备）：参数 4GB + Adam 8GB + 梯度 4GB + 激活 1GB ≈ 17GB / 31.25GB HBM
 
@@ -350,6 +350,8 @@ kubectl annotate serviceaccount tpu-trainer-ksa \
 7. **v7x 多 host 必须创建 workload policy**：`gcloud beta compute resource-policies create workload-policy NAME --type=HIGH_THROUGHPUT --accelerator-topology=TOPOLOGY`；并在 nodeSelector 中指定 `cloud.google.com/placement-policy-name: NAME`。
 8. **v7x pod 不要请求 cpu/memory 资源**：`optimize-utilization-scheduler` 会据此注入错误的 `gke-nodepool: cpu-np` nodeSelector 导致调度失败；只请求 `google.com/tpu`。
 9. **v7x 每节点 8 JAX 设备**：`tpu7x-standard-4t` = 4 物理芯片 × 2 逻辑核 = 8 JAX devices/host；`tpu7x-16`（xpk命名）= 2 hosts × 8 = 16 JAX devices（"16卡"）。
+10. **v7x 用 `FSDP_DEVICES=4`（非 8）**：虽然每 host 有 8 JAX dev，但 `FSDP_DEVICES=8`（dp=2,fsdp=8）会导致 Orbax 在 2-process 多 host checkpoint 时 `process_allgather` 失败。用 `FSDP_DEVICES=4`（dp=4,fsdp=4）与 v6e 相同 mesh 结构，checkpoint 正常。
+11. **GCS 权限用正确的 SA**：`cloud-tpu-multipod-dev` 的计算 SA 是 `735972712744-compute@developer.gserviceaccount.com`（非 `706422770546`）；手动节点池不设 Workload Identity 时需直接授权这个 SA。
 
 ### v7x vs v6e 节点标签差异
 
