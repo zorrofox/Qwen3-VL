@@ -137,7 +137,7 @@ spec:
           GCS_OUTPUT_DIR=gs://grhuang-02-vertex-ai/qwen3vl-8b-v7x-test \
           REPORT_TO=tensorboard \
           RUN_NAME=qwen3vl-8b-v7x16-bench \
-          SAVE_STEPS=1000 \
+          SAVE_STEPS=9999 \
           bash jax_qwenvl/scripts/train_tpu.sh
 
         env:
