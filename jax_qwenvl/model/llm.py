@@ -155,7 +155,7 @@ class TextAttention(nn.Module):
                 mesh=global_mesh,
                 in_specs=(batch_spec, batch_spec, batch_spec, ab_spec),
                 out_specs=batch_spec,
-                check_rep=False,  # q/k 可能在 fsdp 轴上有重复，跳过此检查
+                check_vma=False,  # q/k 可能在 fsdp 轴上有重复，跳过此检查
             )(q, k, v, ab)  # → (B, H_q, L, D)
 
             # (B, H_q, L, D) → (B, L, H_q*D)

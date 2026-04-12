@@ -71,7 +71,7 @@ def test_pallas_under_shard_map():
         mesh=mesh,
         in_specs=(batch_spec, batch_spec, batch_spec, batch_spec),
         out_specs=batch_spec,
-        check_rep=False,
+        check_vma=False,
     )(q, k, v, ab)
 
     assert out.shape == (B_global, H_q, L, D), f"shape 错误: {out.shape}"
@@ -86,7 +86,7 @@ def test_pallas_under_shard_map():
             mesh=mesh,
             in_specs=(batch_spec, batch_spec, batch_spec, batch_spec),
             out_specs=batch_spec,
-            check_rep=False,
+            check_vma=False,
         )(q, k, v, ab).sum()
 
     logger.info("运行 shard_map + Pallas backward (grad) ...")
