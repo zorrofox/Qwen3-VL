@@ -1,0 +1,95 @@
+# TPU v7x Smoke Test — 提交训练 Job 前必须先通过此测试
+#
+# 使用合成数据跑 3 步，验证 Flash Attention forward/backward 正确
+# 无需下载数据集，完成时间 < 10 分钟
+#
+# 使用方法：
+#   kubectl apply -f smoke-test-v7x.yaml
+#   kubectl wait --for=condition=complete job/v7x-smoke-test --timeout=600s \
+#     && echo "PASSED: 可以提交训练 Job" \
+#     || echo "FAILED: 禁止提交训练 Job"
+#   kubectl delete -f smoke-test-v7x.yaml
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: smoke-test-v7x-svc
+spec:
+  clusterIP: None
+  selector:
+    job-name: v7x-smoke-test
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: v7x-smoke-test
+spec:
+  backoffLimit: 0
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  template:
+    spec:
+      subdomain: smoke-test-v7x-svc
+      restartPolicy: Never
+      serviceAccountName: grhuang-trainer-ksa
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x2
+        cloud.google.com/placement-policy-name: grhuang-tpu7x-2x2x2
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+      containers:
+      - name: smoke-test
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest
+        command:
+        - bash
+        - -c
+        - |
+          set -euo pipefail
+          echo "=== [$(date)] Smoke Test Pod ${JOB_COMPLETION_INDEX} ==="
+
+          # 1. 下载代码
+          mkdir -p /workspace && cd /workspace
+          gcloud storage cp gs://grhuang-02-vertex-ai/code/jax_qwenvl.tar.gz .
+          tar xzf jax_qwenvl.tar.gz
+
+          # 2. 安装依赖
+          apt-get update -qq && apt-get install -y -qq python3.11 python3.11-venv python3.11-dev
+          python3.11 -m venv /opt/venv311 && source /opt/venv311/bin/activate
+          pip install --quiet "jax[tpu]==0.9.0" \
+            -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+          pip install --quiet -r jax_qwenvl/requirements.txt \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+
+          # 3. 下载模型（只需权重，不需数据集）
+          mkdir -p /workspace/model
+          gcloud storage cp -r gs://grhuang-02-vertex-ai/models/Qwen3-VL-8B-Instruct/qwen3vl-8b /workspace/model/
+
+          # 4. 运行 Smoke Test（合成数据，3 步，seq_len=256）
+          source /opt/venv311/bin/activate
+          cd /workspace
+          echo "=== [$(date)] 运行 Smoke Test ==="
+          python3 -m jax_qwenvl.tests.smoke_test_tpu \
+            --model_path /workspace/model/qwen3vl-8b \
+            --num_steps 3 \
+            --seq_len 256
+
+          echo "=== [$(date)] Smoke Test PASSED ==="
+
+        env:
+        - name: JOB_COMPLETION_INDEX
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: HF_TOKEN
+          value: "${HF_TOKEN}"
+        resources:
+          requests:
+            google.com/tpu: 4
+          limits:
+            google.com/tpu: 4

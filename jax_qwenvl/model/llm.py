@@ -119,12 +119,15 @@ class TextAttention(nn.Module):
         v = v.astype(compute_dtype)
 
         if jax.default_backend() == "tpu":
-            # Pallas Flash Attention：真正的 O(L) 内存，ab 支持 additive mask
-            # 输入格式 (B, H, L, D)，与 RoPE 后一致，无需 transpose
+            # Pallas Flash Attention：真正的 O(L) 内存
+            # Pallas kernel 要求 ab 精确形状 (B, H, L, L)，不接受 (B, 1, L, L) 广播
             from jax.experimental.pallas.ops.tpu import flash_attention as tpu_fa  # noqa
+            num_heads = q.shape[1]
+            ab = (jnp.broadcast_to(attention_mask, (B, num_heads, L, L))
+                  if attention_mask is not None else None)
             attn_output = tpu_fa.flash_attention(
                 q, k, v,
-                ab=attention_mask,  # (B, 1, L, L) broadcast 至 (B, H, L, L)
+                ab=ab,          # (B, H, L, L) 精确形状
                 sm_scale=scaling,
             )  # → (B, H, L, D)
         else:

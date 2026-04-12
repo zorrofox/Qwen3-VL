@@ -76,9 +76,15 @@ def flash_attention(q, k, v, mask=None):
     k = k.astype(dtype)
     v = v.astype(dtype)
 
+    # Pallas kernel 要求精确形状 (B, H, L, L)，不接受 (B, 1, L, L) 广播
+    # 这里显式 broadcast，与生产代码中 jnp.broadcast_to 保持一致
+    H = q.shape[1]
+    L = q.shape[2]
+    ab_full = (jnp.broadcast_to(mask, (mask.shape[0], H, L, L))
+               if mask is not None else None)
     return mha_reference(
         q, k, v,
-        ab=mask,       # (B, 1, L, L) → broadcast 到 (B, H, L, L)
+        ab=ab_full,    # (B, H, L, L) 精确形状
         sm_scale=scaling,
     )  # → (B, H, L, D)
 
