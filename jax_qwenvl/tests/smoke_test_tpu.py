@@ -1,7 +1,7 @@
 """TPU Smoke Test — 提交训练 Job 前必须通过此测试。
 
-测试实际使用的 attention 实现在 TPU 上能正确运行，
-包括在 jax.jit + jax.grad 下（模拟 SPMD 分区检查）。
+在真实 v7x TPU 上，使用与训练完全相同的 mesh + shard_map + Pallas 配置，
+验证 Flash Attention forward+backward 正确运行。
 
 运行：
     source /opt/venv311/bin/activate && python3 -m jax_qwenvl.tests.smoke_test_tpu
@@ -19,73 +19,96 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-def test_dot_product_attention_spmd():
-    """测试 jax.nn.dot_product_attention 在 jit+grad 下（模拟 SPMD）。
+def test_pallas_under_shard_map():
+    """用与训练完全相同的 mesh + shard_map 路径测试 Pallas Flash Attention。
 
-    Qwen3-VL-8B 实际参数：H=32，H_kv=8，D=128，L=1024（缩小版）。
-    关键：用 jax.jit + jax.grad 触发 XLA 编译和分区检查。
-    如果 attention 实现在 SPMD 下不兼容，这里会报错。
+    配置：Qwen3-VL-8B，FSDP_DEVICES=4，hybrid 模式
+    - mesh: dp=4, fsdp=4（16 设备）
+    - 全局 batch=32，每设备 2 samples
+    - H_q=32, H_kv=8, L=1024, D=128
     """
-    B, H, H_kv, L, D = 2, 32, 8, 1024, 128
+    from jax.experimental.pallas.ops.tpu import flash_attention as tpu_fa
+    from jax.experimental.shard_map import shard_map
+    from jax.sharding import PartitionSpec as P, NamedSharding
+    from jax_qwenvl.train.sharding import create_device_mesh, register_global_mesh
+
+    # 1. 创建与训练相同的 mesh（FSDP_DEVICES=4）
+    mesh = create_device_mesh(dp=-1, fsdp=4)
+    register_global_mesh(mesh, 'hybrid')
+    logger.info("Mesh: dp=%d fsdp=%d total=%d", mesh.shape['dp'], mesh.shape['fsdp'],
+                jax.device_count())
+
+    # 2. 训练参数
+    B_global = jax.device_count() * 2   # 每设备 2 samples，global=32
+    H_q, H_kv, L, D = 32, 8, 1024, 128
     scaling = D ** -0.5
+    batch_spec = P(('dp', 'fsdp'), None, None, None)
 
+    # 3. 构造全局 sharded 张量（与 shard_batch 中 P(('dp','fsdp')) 一致）
     key = jax.random.PRNGKey(0)
-    q = jax.random.normal(key, (B, H, L, D), dtype=jnp.bfloat16)
-    k = jax.random.normal(jax.random.fold_in(key, 1), (B, H_kv, L, D), dtype=jnp.bfloat16)
-    v = jax.random.normal(jax.random.fold_in(key, 2), (B, H_kv, L, D), dtype=jnp.bfloat16)
+    sharding = NamedSharding(mesh, batch_spec)
+    q  = jax.device_put(jax.random.normal(key, (B_global, H_q, L, D), dtype=jnp.bfloat16), sharding)
+    k  = jax.device_put(jax.random.normal(jax.random.fold_in(key,1), (B_global, H_kv, L, D), dtype=jnp.bfloat16), sharding)
+    v  = jax.device_put(jax.random.normal(jax.random.fold_in(key,2), (B_global, H_kv, L, D), dtype=jnp.bfloat16), sharding)
+    # bias: (B_global, 1, L, L) — 与生产代码一致
+    ab = jax.device_put(jnp.zeros((B_global, 1, L, L), dtype=jnp.bfloat16), sharding)
 
-    # Causal mask (B, 1, L, L)
-    pos = jnp.arange(L)
-    causal = (pos[:, None] >= pos[None, :]).astype(jnp.bfloat16)
-    additive = jnp.where(causal, 0.0, jnp.finfo(jnp.float32).min).astype(jnp.bfloat16)
-    mask = additive[None, None, :, :]  # (1, 1, L, L)
+    # 4. shard_map + Pallas（与 llm.py TextAttention 完全相同路径）
+    def _pallas_attn(q_l, k_l, v_l, ab_l):
+        B_l, H_q_l, L_q, _ = q_l.shape
+        ab_full = jnp.broadcast_to(ab_l, (B_l, H_q_l, L_q, L_q))
+        return tpu_fa.flash_attention(q_l, k_l, v_l, ab=ab_full, sm_scale=scaling)
 
-    # 模拟生产代码：GQA 展开 + dtype cast + dot_product_attention
-    def attention_fn(q, k, v):
-        # GQA 展开
-        groups = H // H_kv
-        k_exp = jnp.repeat(k, groups, axis=1)
-        v_exp = jnp.repeat(v, groups, axis=1)
-        # RoPE upcast 模拟：k/q 变成 float32，v 仍 bfloat16，统一 cast
-        dtype = jnp.bfloat16
-        q_t = jnp.transpose(q.astype(dtype), (0, 2, 1, 3))   # (B, L, H, D)
-        k_t = jnp.transpose(k_exp.astype(dtype), (0, 2, 1, 3))
-        v_t = jnp.transpose(v_exp.astype(dtype), (0, 2, 1, 3))
-        out = jax.nn.dot_product_attention(q_t, k_t, v_t, bias=mask, scale=scaling)
-        return out.sum()
+    logger.info("运行 shard_map + Pallas forward (B=%d H_q=%d H_kv=%d L=%d D=%d) ...",
+                B_global, H_q, H_kv, L, D)
+    out = shard_map(
+        _pallas_attn,
+        mesh=mesh,
+        in_specs=(batch_spec, batch_spec, batch_spec, batch_spec),
+        out_specs=batch_spec,
+        check_rep=False,
+    )(q, k, v, ab)
 
-    # 关键：在 jax.jit + jax.grad 下运行（触发 XLA 编译和 SPMD 分区检查）
-    jit_grad_fn = jax.jit(jax.grad(attention_fn, argnums=(0, 1, 2)))
-    logger.info("运行 attention forward+backward (jit+grad, B=%d H=%d L=%d D=%d) ...", B, H, L, D)
-    dq, dk, dv = jit_grad_fn(q, k, v)
+    assert out.shape == (B_global, H_q, L, D), f"shape 错误: {out.shape}"
+    assert out.dtype == jnp.bfloat16, f"dtype 错误: {out.dtype}"
+    assert np.isfinite(np.array(out.sum())), "输出含 NaN/Inf"
+    logger.info("Forward: ✓  shape=%s  dtype=%s", out.shape, out.dtype)
 
-    assert dq.shape == (B, H, L, D), f"dq shape 错误: {dq.shape}"
-    assert dk.shape == (B, H_kv, L, D), f"dk shape 错误: {dk.shape}"
-    assert np.isfinite(np.array(dq).sum()), "dq 含 NaN/Inf"
-    assert np.isfinite(np.array(dk).sum()), "dk 含 NaN/Inf"
-    logger.info("attention jit+grad: ✓")
+    # 5. Backward（梯度计算）— 最关键的：确认 shard_map + Pallas 在 grad 下正常
+    def fn(q, k, v):
+        return shard_map(
+            _pallas_attn,
+            mesh=mesh,
+            in_specs=(batch_spec, batch_spec, batch_spec),
+            out_specs=batch_spec,
+            check_rep=False,
+        )(q, k, v, ab).sum()
+
+    logger.info("运行 shard_map + Pallas backward (grad) ...")
+    dq, dk, dv = jax.grad(fn, argnums=(0, 1, 2))(q, k, v)
+    assert dq.shape == (B_global, H_q, L, D)
+    assert np.isfinite(np.array(dq.sum())), "dq 含 NaN/Inf"
+    assert np.isfinite(np.array(dk.sum())), "dk 含 NaN/Inf"
+    logger.info("Backward: ✓  dq/dk/dv 均有限")
 
 
-def test_vit_attention_spmd():
-    """测试 VisionAttention（无 GQA，block-diagonal mask）在 jit+grad 下。"""
-    S, H, D = 512, 16, 64  # 缩小版视觉 attention
+def test_vit_attention_fallback():
+    """VisionAttention 使用 dot_product_attention（无 GQA，简单 mask）。"""
+    S, H, D = 512, 16, 64
     scaling = D ** -0.5
     key = jax.random.PRNGKey(1)
     q = jax.random.normal(key, (1, S, H, D), dtype=jnp.bfloat16)
     k = jax.random.normal(jax.random.fold_in(key, 1), (1, S, H, D), dtype=jnp.bfloat16)
     v = jax.random.normal(jax.random.fold_in(key, 2), (1, S, H, D), dtype=jnp.bfloat16)
-    # 简单全 attend mask
     mask = jnp.zeros((1, 1, S, S), dtype=jnp.bfloat16)
 
     def vit_attn(q, k, v):
-        out = jax.nn.dot_product_attention(q, k, v, bias=mask, scale=scaling)
-        return out.sum()
+        return jax.nn.dot_product_attention(q, k, v, bias=mask, scale=scaling).sum()
 
-    logger.info("运行 VisionAttention jit+grad (S=%d H=%d) ...", S, H)
     dq, dk, dv = jax.jit(jax.grad(vit_attn, argnums=(0, 1, 2)))(q, k, v)
     assert dq.shape == q.shape
-    assert np.isfinite(np.array(dq).sum())
-    logger.info("VisionAttention jit+grad: ✓")
+    assert np.isfinite(np.array(dq.sum()))
+    logger.info("VisionAttention fallback: ✓")
 
 
 def main():
@@ -97,8 +120,8 @@ def main():
         sys.exit(1)
 
     tests = [
-        ("TextAttention (GQA, causal mask, jit+grad)", test_dot_product_attention_spmd),
-        ("VisionAttention (full mask, jit+grad)", test_vit_attention_spmd),
+        ("Pallas FA via shard_map (hybrid mesh, forward+backward)", test_pallas_under_shard_map),
+        ("VisionAttention dot_product_attention fallback", test_vit_attention_fallback),
     ]
 
     passed = True
