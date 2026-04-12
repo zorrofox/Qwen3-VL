@@ -203,26 +203,32 @@ class VisionAttention(nn.Module):
         # Build block-diagonal attention mask from cu_seqlens
         attn_mask = _build_block_diagonal_mask(cu_seqlens, seq_len)
 
-        # Scaled dot-product attention
+        # Flash Attention via jax.nn.dot_product_attention
+        # VisionAttention：无 GQA，MHA；block-diagonal mask 作为加性 bias 传入
         scaling = head_dim ** -0.5
-        # (seq, heads, dim) -> (heads, seq, dim)
-        q = jnp.transpose(q, (1, 0, 2))  # (H, S, D)
-        k = jnp.transpose(k, (1, 0, 2))
-        v = jnp.transpose(v, (1, 0, 2))
 
-        attn_weights = jnp.matmul(q, jnp.swapaxes(k, -2, -1)) * scaling
-        # attn_mask: (S, S) -- True = attend
-        attn_weights = jnp.where(
-            attn_mask[None, :, :], attn_weights, jnp.finfo(attn_weights.dtype).min
-        )
-        attn_weights = jax.nn.softmax(
-            attn_weights.astype(jnp.float32), axis=-1
-        ).astype(hidden_states.dtype)
-        attn_output = jnp.matmul(attn_weights, v)  # (H, S, D)
+        # 将 boolean mask (S, S) 转为加性 float mask (1, 1, S, S)
+        # True → 0.0（attend），False → -inf（mask）
+        dtype = hidden_states.dtype
+        attn_bias = jnp.where(
+            attn_mask, jnp.zeros_like(attn_mask, dtype=dtype),
+            jnp.full_like(attn_mask, jnp.finfo(jnp.float32).min, dtype=dtype)
+        )[None, None, :, :]  # (1, 1, S, S)
 
-        # (H, S, D) -> (S, H, D) -> (S, hidden)
-        attn_output = jnp.transpose(attn_output, (1, 0, 2))
-        attn_output = attn_output.reshape(seq_len, -1)
+        # q/k/v 当前为 (S, H, D)，dot_product_attention 期望 (..., S, H, D)
+        # 直接加 batch 维：(1, S, H, D)
+        q_b = q[None]  # (1, S, H, D)
+        k_b = k[None]
+        v_b = v[None]
+
+        attn_output = jax.nn.dot_product_attention(
+            q_b, k_b, v_b,
+            bias=attn_bias,
+            scale=scaling,
+        )  # → (1, S, H, D)
+
+        # (1, S, H, D) -> (S, H*D)
+        attn_output = attn_output[0].reshape(seq_len, -1)
 
         # Output projection
         attn_output = nn.Dense(
