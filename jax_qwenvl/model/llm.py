@@ -110,9 +110,12 @@ class TextAttention(nn.Module):
         scaling = head_dim ** -0.5
 
         # dot_product_attention 期望 (B, L, H, D)，RoPE 后从 (B, H, L, D) 转换
-        q_t = jnp.transpose(q, (0, 2, 1, 3))  # (B, H, L, D) → (B, L, H, D)
-        k_t = jnp.transpose(k, (0, 2, 1, 3))  # (B, H_kv, L, D) → (B, L, H_kv, D)
-        v_t = jnp.transpose(v, (0, 2, 1, 3))
+        # 注意：RoPE (cos/sin float32) × q/k(bf16) → float32，v 未过 RoPE 仍是 bf16
+        # dot_product_attention 要求 q/k/v dtype 严格一致，统一转回训练 dtype
+        compute_dtype = hidden_states.dtype
+        q_t = jnp.transpose(q, (0, 2, 1, 3)).astype(compute_dtype)  # (B, L, H, D)
+        k_t = jnp.transpose(k, (0, 2, 1, 3)).astype(compute_dtype)  # (B, L, H_kv, D)
+        v_t = jnp.transpose(v, (0, 2, 1, 3)).astype(compute_dtype)
 
         attn_output = jax.nn.dot_product_attention(
             q_t, k_t, v_t,

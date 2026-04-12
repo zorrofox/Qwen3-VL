@@ -231,10 +231,40 @@ def test_gqa_with_causal_mask():
 
 
 # ---------------------------------------------------------------------------
-# 测试 6：输出形状正确
+# 测试 6（回归）：RoPE upcast 场景 — q/k float32，v bfloat16
+# 这是实际训练时的真实情况：RoPE cos/sin 是 float32，
+# q*cos 自动 upcast 到 float32，但 v 未过 RoPE 仍是 bfloat16。
+# dot_product_attention 要求严格 dtype 一致，必须先 cast。
 # ---------------------------------------------------------------------------
 
-def test_output_shape():
+def test_rope_upcast_dtype_mismatch():
+    """q/k float32（模拟 RoPE upcast），v bfloat16 → 统一 cast 后应正常运行。"""
+    key = jax.random.PRNGKey(55)
+    B, H, H_kv, L, D = 1, 8, 2, 16, 32
+
+    # v 是 bfloat16，q/k 是 float32（模拟 RoPE upcast）
+    q = jax.random.normal(key, (B, H, L, D), dtype=jnp.float32)
+    k = jax.random.normal(jax.random.fold_in(key, 1), (B, H_kv, L, D), dtype=jnp.float32)
+    v = jax.random.normal(jax.random.fold_in(key, 2), (B, H_kv, L, D), dtype=jnp.bfloat16)
+    compute_dtype = jnp.bfloat16
+
+    scaling = D ** -0.5
+    # 统一 cast（生产代码中的修复）
+    q_t = jnp.transpose(q, (0, 2, 1, 3)).astype(compute_dtype)
+    k_t = jnp.transpose(k, (0, 2, 1, 3)).astype(compute_dtype)
+    v_t = jnp.transpose(v, (0, 2, 1, 3)).astype(compute_dtype)
+
+    # 不应报错
+    out = jax.nn.dot_product_attention(q_t, k_t, v_t, scale=scaling, implementation="xla")
+    assert out.shape == (B, L, H, D), f"期望 {(B, L, H, D)}，得到 {out.shape}"
+    assert out.dtype == compute_dtype, f"输出 dtype 应为 {compute_dtype}，得到 {out.dtype}"
+
+
+# ---------------------------------------------------------------------------
+# 测试 7：输出形状正确
+# ---------------------------------------------------------------------------
+
+def test_output_shape():  # 原测试 6 → 现在是测试 7
     """flash_attention 输出形状必须与参考实现一致。"""
     key = jax.random.PRNGKey(0)
     B, H, H_kv, L, D = 2, 8, 2, 20, 16
