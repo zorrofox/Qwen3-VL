@@ -64,18 +64,11 @@ spec:
           pip install --quiet -r jax_qwenvl/requirements.txt \
             --extra-index-url https://download.pytorch.org/whl/cpu
 
-          # 3. 下载模型（只需权重，不需数据集）
-          mkdir -p /workspace/model
-          gcloud storage cp -r gs://grhuang-02-vertex-ai/models/Qwen3-VL-8B-Instruct/qwen3vl-8b /workspace/model/
-
-          # 4. 运行 Smoke Test（合成数据，3 步，seq_len=256）
+          # 3. 运行 Smoke Test（纯合成数据，无需下载模型/数据集）
           source /opt/venv311/bin/activate
           cd /workspace
           echo "=== [$(date)] 运行 Smoke Test ==="
-          python3 -m jax_qwenvl.tests.smoke_test_tpu \
-            --model_path /workspace/model/qwen3vl-8b \
-            --num_steps 3 \
-            --seq_len 256
+          python3 -m jax_qwenvl.tests.smoke_test_tpu
 
           echo "=== [$(date)] Smoke Test PASSED ==="
 
