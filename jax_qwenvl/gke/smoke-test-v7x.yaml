@@ -80,7 +80,7 @@ spec:
         - name: PYTHONUNBUFFERED
           value: "1"
         - name: HF_TOKEN
-          value: "${HF_TOKEN}"
+          value: "${HF_TOKEN}"  # 从 Kubernetes Secret 或环境变量注入，禁止硬编码
         resources:
           requests:
             google.com/tpu: 4
