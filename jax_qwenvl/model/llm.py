@@ -102,81 +102,38 @@ class TextAttention(nn.Module):
         # Apply MRoPE
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # Attention 计算
-        # RoPE (cos/sin float32) 让 q/k upcast 为 float32，v 仍是 bf16，统一 cast
+        # Pallas Flash Attention（TPU）/ jax.nn.dot_product_attention（CPU/GPU 回退）
+        # 注意：RoPE (cos/sin float32) 让 q/k upcast 为 float32，v 仍是 bf16
+        # 统一 cast 后再计算
         compute_dtype = hidden_states.dtype
         scaling = head_dim ** -0.5
+
+        # GQA 展开：Pallas 不支持 GQA，dot_product_attention 支持但需要 cast
+        # 两条路都需要展开 K/V，保持一致
+        if num_kv_groups > 1:
+            k = jnp.repeat(k, num_kv_groups, axis=1)  # (B, H, L, D)
+            v = jnp.repeat(v, num_kv_groups, axis=1)
+
         q = q.astype(compute_dtype)
         k = k.astype(compute_dtype)
         v = v.astype(compute_dtype)
 
-        # bias：None 时用 zeros，避免 shard_map 的 optional 参数问题
-        ab = attention_mask if attention_mask is not None \
-             else jnp.zeros((B, 1, L, L), dtype=compute_dtype)
+        # jax.nn.dot_product_attention — SPMD 兼容，O(L²) 内存
+        # 注意：Pallas Flash Attention（真正 O(L) 内存）在 JAX 0.9.0 的 FSDP/SPMD 下
+        # 要求显式 shard_map 包装，需要 mesh 传入模型层，属于架构级改动，待后续单独实现。
+        # dot_product_attention 期望 (B, L, H, D)，RoPE 后从 (B, H, L, D) 转换
+        q_t = jnp.transpose(q, (0, 2, 1, 3)).astype(compute_dtype)  # (B, L, H, D)
+        k_t = jnp.transpose(k, (0, 2, 1, 3)).astype(compute_dtype)  # (B, L, H_kv, D) — GQA 已展开
+        v_t = jnp.transpose(v, (0, 2, 1, 3)).astype(compute_dtype)
 
-        from jax_qwenvl.train.sharding import get_global_mesh  # noqa
-        global_mesh, sharding_mode = get_global_mesh()
+        attn_output = jax.nn.dot_product_attention(
+            q_t, k_t, v_t,
+            bias=attention_mask,   # (B, 1, L, L) 加性 mask，broadcast 至各 head
+            scale=scaling,
+        )  # → (B, L, H, D)
 
-        if global_mesh is not None and jax.default_backend() == "tpu":
-            # ── Pallas Flash Attention via shard_map（O(L) 内存）──────────
-            # Pallas 不支持 GQA，在 _pallas_attn 内部展开 K/V heads
-            # shard_map 将 batch 维度按 mesh 分区，每 device 独立运行 Pallas kernel
-            from jax.experimental.pallas.ops.tpu import flash_attention as tpu_fa  # noqa
-            from jax import shard_map  # noqa (jax.experimental.shard_map 在 JAX 0.8+ 弃用)
-            from jax.sharding import PartitionSpec as P  # noqa
-
-            if sharding_mode == 'hybrid':
-                batch_spec = P(('dp', 'fsdp'), None, None, None)
-                ab_spec    = P(('dp', 'fsdp'), None, None, None)
-            elif sharding_mode == 'fsdp':
-                batch_spec = P('fsdp', None, None, None)
-                ab_spec    = P('fsdp', None, None, None)
-            else:  # dp
-                batch_spec = P('dp', None, None, None)
-                ab_spec    = P('dp', None, None, None)
-
-            def _pallas_attn(q_l, k_l, v_l, ab_l):
-                # 在 shard_map 内：本地张量，batch 维已是各 device 的分片
-                # Pallas 不支持 GQA，展开 K/V heads
-                B_l, H_q, L_q, _ = q_l.shape
-                if num_kv_groups > 1:
-                    k_l = jnp.repeat(k_l, num_kv_groups, axis=1)
-                    v_l = jnp.repeat(v_l, num_kv_groups, axis=1)
-                # bias 需要广播到精确形状 (B_local, H_q, L, L)
-                ab_full = jnp.broadcast_to(ab_l, (B_l, H_q, L_q, L_q))
-                return tpu_fa.flash_attention(
-                    q_l, k_l, v_l,
-                    ab=ab_full,
-                    sm_scale=scaling,
-                )  # → (B_local, H_q, L, D)
-
-            attn_output = shard_map(
-                _pallas_attn,
-                mesh=global_mesh,
-                in_specs=(batch_spec, batch_spec, batch_spec, ab_spec),
-                out_specs=batch_spec,
-                check_vma=False,  # q/k 可能在 fsdp 轴上有重复，跳过此检查
-            )(q, k, v, ab)  # → (B, H_q, L, D)
-
-            # (B, H_q, L, D) → (B, L, H_q*D)
-            attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
-            attn_output = attn_output.reshape(B, L, -1)
-
-        else:
-            # ── CPU/GPU 回退 / mesh 未注册时（单元测试、开发环境）──────────
-            # GQA 展开（dot_product_attention 需要显式展开）
-            if num_kv_groups > 1:
-                k = jnp.repeat(k, num_kv_groups, axis=1)
-                v = jnp.repeat(v, num_kv_groups, axis=1)
-            q_t = jnp.transpose(q, (0, 2, 1, 3))
-            k_t = jnp.transpose(k, (0, 2, 1, 3))
-            v_t = jnp.transpose(v, (0, 2, 1, 3))
-            attn_output = jax.nn.dot_product_attention(
-                q_t, k_t, v_t,
-                bias=attention_mask,
-                scale=scaling,
-            )  # → (B, L, H, D)
-            attn_output = attn_output.reshape(B, L, -1)
+        # Reshape: (B, L, H, D) -> (B, L, H*D)
+        attn_output = attn_output.reshape(B, L, -1)
 
         # Output projection
         if self.lora_rank > 0:

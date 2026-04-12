@@ -284,37 +284,3 @@ def test_output_shape():  # 原测试 6 → 现在是测试 7
 
     out = flash_attention(q, k, v)
     assert out.shape == (B, H, L, D), f"期望 {(B, H, L, D)}，得到 {out.shape}"
-
-
-# ---------------------------------------------------------------------------
-# 测试 8（回归）：bias broadcast (B,1,L,L) → (B,H,L,L)
-# Pallas 要求精确形状，shard_map 内部需要 broadcast；此测试验证逻辑正确性
-# ---------------------------------------------------------------------------
-
-def test_bias_broadcast_to_full_heads():
-    """(B, 1, L, L) bias 广播到 (B, H, L, L) 后等价于各 head 独立计算。"""
-    key = jax.random.PRNGKey(42)
-    B, H, L, D = 2, 8, 16, 32
-    q = jax.random.normal(key, (B, H, L, D), dtype=jnp.bfloat16)
-    k = jax.random.normal(jax.random.fold_in(key, 1), (B, H, L, D), dtype=jnp.bfloat16)
-    v = jax.random.normal(jax.random.fold_in(key, 2), (B, H, L, D), dtype=jnp.bfloat16)
-
-    # 构造 (B, 1, L, L) causal mask
-    pos = jnp.arange(L)
-    causal = (pos[:, None] >= pos[None, :]).astype(jnp.bfloat16)
-    mask_1 = jnp.where(causal, 0.0, jnp.finfo(jnp.float32).min).astype(jnp.bfloat16)
-    mask_broadcast = mask_1[None, None, :, :]  # (1, 1, L, L)
-
-    # 广播到 (B, H, L, L)
-    mask_full = jnp.broadcast_to(mask_broadcast, (B, H, L, L))
-
-    # 用 (B, 1, L, L) 和 (B, H, L, L) 分别调用 flash_attention（CPU 路径）
-    out_1 = flash_attention(q, k, v, mask=mask_broadcast)
-    out_full = flash_attention(q, k, v, mask=mask_full)
-
-    np.testing.assert_allclose(
-        np.array(out_1, dtype=np.float32),
-        np.array(out_full, dtype=np.float32),
-        atol=1e-5, rtol=1e-5,
-        err_msg="(B,1,L,L) broadcast 与 (B,H,L,L) 完整 mask 结果应完全相同"
-    )

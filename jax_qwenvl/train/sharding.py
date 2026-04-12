@@ -237,23 +237,3 @@ def _shard_batch_multihost(batch, mesh: Mesh, mode: str = 'dp'):
         _shard_field(name, val) for name, val in zip(field_names, batch)
     )
     return type(batch)(*sharded_values)
-
-
-# ---------------------------------------------------------------------------
-# 全局 mesh 注册（供模型层内部获取 mesh 和 sharding_mode）
-# ---------------------------------------------------------------------------
-
-_GLOBAL_MESH = None
-_GLOBAL_SHARDING_MODE: str = 'dp'
-
-
-def register_global_mesh(mesh: Mesh, sharding_mode: str = 'dp') -> None:
-    """在训练开始前注册全局 mesh，供 TextAttention 中 shard_map 使用。"""
-    global _GLOBAL_MESH, _GLOBAL_SHARDING_MODE
-    _GLOBAL_MESH = mesh
-    _GLOBAL_SHARDING_MODE = sharding_mode
-
-
-def get_global_mesh():
-    """返回 (mesh, sharding_mode)；未注册时返回 (None, 'dp')。"""
-    return _GLOBAL_MESH, _GLOBAL_SHARDING_MODE
