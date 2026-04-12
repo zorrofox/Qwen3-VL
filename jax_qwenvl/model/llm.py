@@ -119,10 +119,10 @@ class TextAttention(nn.Module):
 
         if global_mesh is not None and jax.default_backend() == "tpu":
             # ── Pallas Flash Attention via shard_map（O(L) 内存）──────────
-            # Pallas 原生支持 GQA（H_q=32, H_kv=8, 32 % 8 == 0），无需 jnp.repeat
+            # Pallas 不支持 GQA，在 _pallas_attn 内部展开 K/V heads
             # shard_map 将 batch 维度按 mesh 分区，每 device 独立运行 Pallas kernel
             from jax.experimental.pallas.ops.tpu import flash_attention as tpu_fa  # noqa
-            from jax.experimental.shard_map import shard_map  # noqa
+            from jax import shard_map  # noqa (jax.experimental.shard_map 在 JAX 0.8+ 弃用)
             from jax.sharding import PartitionSpec as P  # noqa
 
             if sharding_mode == 'hybrid':
@@ -137,8 +137,12 @@ class TextAttention(nn.Module):
 
             def _pallas_attn(q_l, k_l, v_l, ab_l):
                 # 在 shard_map 内：本地张量，batch 维已是各 device 的分片
-                # Pallas 要求 bias 精确形状 (B_local, H_q, L, L)
+                # Pallas 不支持 GQA，展开 K/V heads
                 B_l, H_q, L_q, _ = q_l.shape
+                if num_kv_groups > 1:
+                    k_l = jnp.repeat(k_l, num_kv_groups, axis=1)
+                    v_l = jnp.repeat(v_l, num_kv_groups, axis=1)
+                # bias 需要广播到精确形状 (B_local, H_q, L, L)
                 ab_full = jnp.broadcast_to(ab_l, (B_l, H_q, L_q, L_q))
                 return tpu_fa.flash_attention(
                     q_l, k_l, v_l,

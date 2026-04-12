@@ -28,7 +28,7 @@ def test_pallas_under_shard_map():
     - H_q=32, H_kv=8, L=1024, D=128
     """
     from jax.experimental.pallas.ops.tpu import flash_attention as tpu_fa
-    from jax.experimental.shard_map import shard_map
+    from jax import shard_map  # jax.experimental.shard_map 在 JAX 0.8+ 弃用
     from jax.sharding import PartitionSpec as P, NamedSharding
     from jax_qwenvl.train.sharding import create_device_mesh, register_global_mesh
 
@@ -56,6 +56,11 @@ def test_pallas_under_shard_map():
     # 4. shard_map + Pallas（与 llm.py TextAttention 完全相同路径）
     def _pallas_attn(q_l, k_l, v_l, ab_l):
         B_l, H_q_l, L_q, _ = q_l.shape
+        # Pallas 不支持 GQA，展开 K/V（H_q=32, H_kv=8, groups=4）
+        num_kv_groups = H_q // H_kv
+        if num_kv_groups > 1:
+            k_l = jnp.repeat(k_l, num_kv_groups, axis=1)
+            v_l = jnp.repeat(v_l, num_kv_groups, axis=1)
         ab_full = jnp.broadcast_to(ab_l, (B_l, H_q_l, L_q, L_q))
         return tpu_fa.flash_attention(q_l, k_l, v_l, ab=ab_full, sm_scale=scaling)
 
@@ -75,17 +80,17 @@ def test_pallas_under_shard_map():
     logger.info("Forward: ✓  shape=%s  dtype=%s", out.shape, out.dtype)
 
     # 5. Backward（梯度计算）— 最关键的：确认 shard_map + Pallas 在 grad 下正常
-    def fn(q, k, v):
+    def fn(q, k, v, ab):
         return shard_map(
             _pallas_attn,
             mesh=mesh,
-            in_specs=(batch_spec, batch_spec, batch_spec),
+            in_specs=(batch_spec, batch_spec, batch_spec, batch_spec),
             out_specs=batch_spec,
             check_rep=False,
         )(q, k, v, ab).sum()
 
     logger.info("运行 shard_map + Pallas backward (grad) ...")
-    dq, dk, dv = jax.grad(fn, argnums=(0, 1, 2))(q, k, v)
+    dq, dk, dv = jax.grad(fn, argnums=(0, 1, 2))(q, k, v, ab)
     assert dq.shape == (B_global, H_q, L, D)
     assert np.isfinite(np.array(dq.sum())), "dq 含 NaN/Inf"
     assert np.isfinite(np.array(dk.sum())), "dk 含 NaN/Inf"
