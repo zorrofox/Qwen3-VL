@@ -386,4 +386,4 @@ Hybrid 关键设计：`P(('dp', 'fsdp'))` batch 分片；参数分片与纯 FSDP
 - `verify-tpu-v6e-16.yaml`：TPU 设备验证 Job
 - `qwen3vl-8b-train-job.yaml`：8B 训练 Job（含 Workload Identity、Python 3.11、完整注释）
 
-GCS 输出（`gs://grhuang-02-vertex-ai/qwen3vl-8b-full-epoch/`）：7 safetensors + index.json + processor files + checkpoints/4600~4928
+GCS 输出（`gs://YOUR_GCS_BUCKET/qwen3vl-8b-full-epoch/`）：7 safetensors + index.json + processor files + checkpoints/4600~4928

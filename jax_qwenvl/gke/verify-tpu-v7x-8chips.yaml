@@ -8,8 +8,8 @@
 # 用途：验证 v7x 单 host 可用（无需 workload policy）
 #
 # 前提：
-#   gcloud container clusters get-credentials bodaborg-tpu7x-auto-nap2 \
-#     --region=us-central1 --project=cloud-tpu-multipod-dev
+#   gcloud container clusters get-credentials YOUR_GKE_CLUSTER \
+#     --region=us-central1 --project=YOUR_GCP_PROJECT
 #   # 将当前机器 IP 加入授权网络（若从私有网络外访问）
 #
 # 提交：

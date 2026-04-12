@@ -3,15 +3,15 @@
 # 前提条件（一次性设置）：
 #   1. 集群启用 Workload Identity:
 #      gcloud container clusters update tpu-v6e-cluster --location=asia-northeast1-b \
-#        --workload-pool=grhuang-02.svc.id.goog
+#        --workload-pool=YOUR_GCP_PROJECT.svc.id.goog
 #   2. 节点池创建时加 --workload-metadata=GKE_METADATA
 #   3. 创建并绑定 SA（见 CLAUDE.md GKE 章节）:
-#      - GSA: tpu-trainer-sa@grhuang-02.iam.gserviceaccount.com
-#        已授权 roles/storage.objectAdmin on gs://grhuang-02-asia
+#      - GSA: tpu-trainer-sa@YOUR_GCP_PROJECT.iam.gserviceaccount.com
+#        已授权 roles/storage.objectAdmin on gs://YOUR_GCS_BUCKET_ASIA
 #      - KSA: tpu-trainer-ksa (default namespace)
-#        已注解 iam.gke.io/gcp-service-account=tpu-trainer-sa@grhuang-02.iam.gserviceaccount.com
+#        已注解 iam.gke.io/gcp-service-account=tpu-trainer-sa@YOUR_GCP_PROJECT.iam.gserviceaccount.com
 #   4. 上传代码: tar czf /tmp/jax_qwenvl.tar.gz jax_qwenvl/ &&
-#               gcloud storage cp /tmp/jax_qwenvl.tar.gz gs://grhuang-02-asia/code/
+#               gcloud storage cp /tmp/jax_qwenvl.tar.gz gs://YOUR_GCS_BUCKET_ASIA/code/
 #
 # 已验证结果 (2026-04-05):
 #   step_time=0.78s | tokens/s=~12.4k | avg_loss=1.82 (30步)
@@ -62,7 +62,7 @@ spec:
           # 1. 下载代码
           echo "=== [$(date)] Downloading jax_qwenvl code ==="
           mkdir -p /workspace && cd /workspace
-          gcloud storage cp gs://grhuang-02-asia/code/jax_qwenvl.tar.gz .
+          gcloud storage cp gs://YOUR_GCS_BUCKET_ASIA/code/jax_qwenvl.tar.gz .
           tar xzf jax_qwenvl.tar.gz
 
           # 2. 安装 Python 3.11 + 依赖（必须用 3.11，容器默认 3.12 与训练代码不兼容）
@@ -80,10 +80,10 @@ spec:
           echo "=== [$(date)] Downloading dataset ==="
           mkdir -p /data/llava
           gcloud storage cp \
-            gs://grhuang-02-vertex-ai/datasets/llava_data/llava_instruct_150k.json \
+            gs://YOUR_GCS_BUCKET/datasets/llava_data/llava_instruct_150k.json \
             /data/llava/
           gcloud storage cp \
-            gs://grhuang-02-vertex-ai/datasets/llava_data/train2017.zip \
+            gs://YOUR_GCS_BUCKET/datasets/llava_data/train2017.zip \
             /data/llava/
           echo "=== [$(date)] Unzipping train2017.zip ==="
           python3 -c "import zipfile; zipfile.ZipFile('/data/llava/train2017.zip').extractall('/data/llava/')"
@@ -99,7 +99,7 @@ spec:
           FSDP_DEVICES=4 \
           MAX_STEPS=30 \
           MAX_PIXELS=50176 \
-          GCS_OUTPUT_DIR=gs://grhuang-02-asia/qwen3vl-8b-test \
+          GCS_OUTPUT_DIR=gs://YOUR_GCS_BUCKET_ASIA/qwen3vl-8b-test \
           REPORT_TO=tensorboard \
           RUN_NAME=qwen3vl-8b-v6e16-bench \
           SAVE_STEPS=1000 \

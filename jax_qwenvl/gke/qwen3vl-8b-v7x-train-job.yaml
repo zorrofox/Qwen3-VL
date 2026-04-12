@@ -13,25 +13,25 @@
 #
 # 前提（一次性设置）：
 #   # 1. 获取集群凭据 + 添加 IP 到授权网络
-#   gcloud container clusters get-credentials bodaborg-tpu7x-auto-nap2 \
-#     --region=us-central1 --project=cloud-tpu-multipod-dev
+#   gcloud container clusters get-credentials YOUR_GKE_CLUSTER \
+#     --region=us-central1 --project=YOUR_GCP_PROJECT
 #   MY_IP=$(curl -s ifconfig.me)
-#   gcloud container clusters update bodaborg-tpu7x-auto-nap2 --region=us-central1 \
+#   gcloud container clusters update YOUR_GKE_CLUSTER --region=us-central1 \
 #     --enable-master-authorized-networks \
 #     --master-authorized-networks="${MY_IP}/32,<existing_cidrs>"
 #
-#   # 2. 创建 workload policy（已创建：grhuang-tpu7x-2x2x2）
-#   gcloud beta compute resource-policies create workload-policy grhuang-tpu7x-2x2x2 \
+#   # 2. 创建 workload policy（已创建：YOUR_WORKLOAD_POLICY）
+#   gcloud beta compute resource-policies create workload-policy YOUR_WORKLOAD_POLICY \
 #     --type=HIGH_THROUGHPUT --accelerator-topology=2x2x2 \
-#     --project=cloud-tpu-multipod-dev --region=us-central1
+#     --project=YOUR_GCP_PROJECT --region=us-central1
 #
 #   # 3. 上传代码
 #   tar czf /tmp/jax_qwenvl.tar.gz jax_qwenvl/ && \
-#   gcloud storage cp /tmp/jax_qwenvl.tar.gz gs://grhuang-02-vertex-ai/code/
+#   gcloud storage cp /tmp/jax_qwenvl.tar.gz gs://YOUR_GCS_BUCKET/code/
 #
-#   # 4. 授权 cloud-tpu-multipod-dev 节点 SA 访问 GCS
-#   gcloud storage buckets add-iam-policy-binding gs://grhuang-02-vertex-ai \
-#     --member="serviceAccount:706422770546-compute@developer.gserviceaccount.com" \
+#   # 4. 授权 YOUR_GCP_PROJECT 节点 SA 访问 GCS
+#   gcloud storage buckets add-iam-policy-binding gs://YOUR_GCS_BUCKET \
+#     --member="serviceAccount:YOUR_COMPUTE_SA@developer.gserviceaccount.com" \
 #     --role="roles/storage.objectAdmin"
 #   # （已完成：SA 已有 roles/storage.objectAdmin）
 #
@@ -65,8 +65,8 @@ spec:
       nodeSelector:
         cloud.google.com/gke-tpu-accelerator: tpu7x      # v7x 加速器标签
         cloud.google.com/gke-tpu-topology: 2x2x2          # tpu7x-16: 2 hosts, 16 JAX dev
-        cloud.google.com/placement-policy-name: grhuang-tpu7x-2x2x2  # 多 host 必须
-      serviceAccountName: grhuang-trainer-ksa   # Workload Identity → grhuang-tpu-trainer GSA
+        cloud.google.com/placement-policy-name: YOUR_WORKLOAD_POLICY  # 多 host 必须
+      serviceAccountName: YOUR_KSA   # Workload Identity → YOUR_GSA
       tolerations:
       - key: "google.com/tpu"
         operator: "Exists"
@@ -84,7 +84,7 @@ spec:
           # 1. 下载代码
           echo "=== [$(date)] Downloading jax_qwenvl code ==="
           mkdir -p /workspace && cd /workspace
-          gcloud storage cp gs://grhuang-02-vertex-ai/code/jax_qwenvl.tar.gz .
+          gcloud storage cp gs://YOUR_GCS_BUCKET/code/jax_qwenvl.tar.gz .
           tar xzf jax_qwenvl.tar.gz
 
           # 2. 安装 Python 3.11 + 依赖
@@ -107,17 +107,17 @@ spec:
           # 3. 从 GCS 下载模型（避免 HuggingFace CDN/Xet 问题）
           echo "=== [$(date)] Downloading model from GCS ==="
           mkdir -p /workspace/model
-          gcloud storage cp -r gs://grhuang-02-vertex-ai/models/Qwen3-VL-8B-Instruct/qwen3vl-8b /workspace/model/
+          gcloud storage cp -r gs://YOUR_GCS_BUCKET/models/Qwen3-VL-8B-Instruct/qwen3vl-8b /workspace/model/
           echo "=== [$(date)] Model ready: $(ls /workspace/model/qwen3vl-8b/*.safetensors 2>/dev/null | wc -l) safetensors files ==="
 
           # 4. 下载数据集
           echo "=== [$(date)] Downloading dataset ==="
           mkdir -p /data/llava
           gcloud storage cp \
-            gs://grhuang-02-vertex-ai/datasets/llava_data/llava_instruct_150k.json \
+            gs://YOUR_GCS_BUCKET/datasets/llava_data/llava_instruct_150k.json \
             /data/llava/
           gcloud storage cp \
-            gs://grhuang-02-vertex-ai/datasets/llava_data/train2017.zip \
+            gs://YOUR_GCS_BUCKET/datasets/llava_data/train2017.zip \
             /data/llava/
           echo "=== [$(date)] Unzipping train2017.zip ==="
           python3 -c "import zipfile; zipfile.ZipFile('/data/llava/train2017.zip').extractall('/data/llava/')"
@@ -136,7 +136,7 @@ spec:
           MAX_STEPS=30 \
           MAX_PIXELS=50176 \
           MODEL_MAX_LENGTH=8192 \
-          GCS_OUTPUT_DIR=gs://grhuang-02-vertex-ai/qwen3vl-8b-v7x-test \
+          GCS_OUTPUT_DIR=gs://YOUR_GCS_BUCKET/qwen3vl-8b-v7x-test \
           REPORT_TO=tensorboard \
           RUN_NAME=qwen3vl-8b-v7x16-L8192-bench \
           SAVE_STEPS=9999 \

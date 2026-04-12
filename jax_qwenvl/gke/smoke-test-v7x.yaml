@@ -32,11 +32,11 @@ spec:
     spec:
       subdomain: smoke-test-v7x-svc
       restartPolicy: Never
-      serviceAccountName: grhuang-trainer-ksa
+      serviceAccountName: YOUR_KSA
       nodeSelector:
         cloud.google.com/gke-tpu-accelerator: tpu7x
         cloud.google.com/gke-tpu-topology: 2x2x2
-        cloud.google.com/placement-policy-name: grhuang-tpu7x-2x2x2
+        cloud.google.com/placement-policy-name: YOUR_WORKLOAD_POLICY
       tolerations:
       - key: "google.com/tpu"
         operator: "Exists"
@@ -53,7 +53,7 @@ spec:
 
           # 1. 下载代码
           mkdir -p /workspace && cd /workspace
-          gcloud storage cp gs://grhuang-02-vertex-ai/code/jax_qwenvl.tar.gz .
+          gcloud storage cp gs://YOUR_GCS_BUCKET/code/jax_qwenvl.tar.gz .
           tar xzf jax_qwenvl.tar.gz
 
           # 2. 安装依赖

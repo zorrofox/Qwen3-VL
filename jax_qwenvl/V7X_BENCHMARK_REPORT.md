@@ -3,7 +3,7 @@
 > 日期：2026-04-12  
 > 模型：Qwen3-VL-8B-Instruct  
 > 数据集：llava_instruct_150k（157,712 样本）  
-> 集群：GKE `bodaborg-tpu7x-auto-nap2`，us-central1-c  
+> 集群：GKE `YOUR_GKE_CLUSTER`，us-central1-c  
 
 ---
 
@@ -250,8 +250,8 @@ kubectl apply -f jax_qwenvl/gke/qwen3vl-8b-v7x-train-job.yaml
 |------|------|---------|
 | 调度失败（nodeSelector 注入错误） | `optimize-utilization-scheduler` 把 cpu/memory 请求映射到 `cpu-np` 节点池 | pod spec 中**不要**请求 cpu/memory，只请求 `google.com/tpu: 4` |
 | multi-host 需要 workload policy | v7x Ironwood 要求 `HIGH_THROUGHPUT` workload policy | `gcloud beta compute resource-policies create workload-policy NAME --type=HIGH_THROUGHPUT --accelerator-topology=2x2x2` |
-| GCS 403 | 节点 SA 项目号混用（`706422770546` vs `735972712744`） | 授权正确的 SA：`735972712744-compute@developer.gserviceaccount.com` |
-| HuggingFace 下载挂起 | Xet CDN 在 v7x pod 网络环境不可访问 | 预先下载到 GCS：`gs://grhuang-02-vertex-ai/models/Qwen3-VL-8B-Instruct/qwen3vl-8b/` |
+| GCS 403 | 节点 SA 项目号混用（`WRONG_PROJECT_SA` vs `CORRECT_PROJECT_SA`） | 授权正确的 SA：`YOUR_COMPUTE_SA@developer.gserviceaccount.com` |
+| HuggingFace 下载挂起 | Xet CDN 在 v7x pod 网络环境不可访问 | 预先下载到 GCS：`gs://YOUR_GCS_BUCKET/models/Qwen3-VL-8B-Instruct/qwen3vl-8b/` |
 | Checkpoint 保存崩溃 | `FSDP_DEVICES=8` 下 Orbax 2-process allgather 有 bug | 使用 `FSDP_DEVICES=4`（dp=4, fsdp=4），与 v6e 相同 mesh 结构 |
 
 ---

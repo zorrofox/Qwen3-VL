@@ -1,10 +1,10 @@
 # TPU v7x 单 host 验证 Job（4 chips，无需 workload policy）
 #
-# 用途：在 bodaborg-tpu7x-auto-nap2 集群验证 v7x 节点可用性
+# 用途：在 YOUR_GKE_CLUSTER 集群验证 v7x 节点可用性
 #
 # 前提：
-#   gcloud container clusters get-credentials bodaborg-tpu7x-auto-nap2 \
-#     --region=us-central1 --project=cloud-tpu-multipod-dev
+#   gcloud container clusters get-credentials YOUR_GKE_CLUSTER \
+#     --region=us-central1 --project=YOUR_GCP_PROJECT
 #
 # 提交：
 #   kubectl apply -f verify-tpu-v7x-4chips.yaml
