@@ -118,31 +118,21 @@ class TextAttention(nn.Module):
         k = k.astype(compute_dtype)
         v = v.astype(compute_dtype)
 
-        if jax.default_backend() == "tpu":
-            # Pallas Flash Attention：真正的 O(L) 内存
-            # Pallas kernel 要求 ab 精确形状 (B, H, L, L)，不接受 (B, 1, L, L) 广播
-            from jax.experimental.pallas.ops.tpu import flash_attention as tpu_fa  # noqa
-            num_heads = q.shape[1]
-            ab = (jnp.broadcast_to(attention_mask, (B, num_heads, L, L))
-                  if attention_mask is not None else None)
-            attn_output = tpu_fa.flash_attention(
-                q, k, v,
-                ab=ab,          # (B, H, L, L) 精确形状
-                sm_scale=scaling,
-            )  # → (B, H, L, D)
-        else:
-            # CPU/GPU 回退：jax.nn.dot_product_attention
-            # 期望 (B, L, H, D)，需要 transpose
-            q_t = jnp.transpose(q, (0, 2, 1, 3))
-            k_t = jnp.transpose(k, (0, 2, 1, 3))
-            v_t = jnp.transpose(v, (0, 2, 1, 3))
-            attn_output = jax.nn.dot_product_attention(
-                q_t, k_t, v_t, bias=attention_mask, scale=scaling,
-            )  # → (B, L, H, D)
-            attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))  # → (B, H, L, D)
+        # jax.nn.dot_product_attention — SPMD 兼容，O(L²) 内存
+        # 注意：Pallas Flash Attention（真正 O(L) 内存）在 JAX 0.9.0 的 FSDP/SPMD 下
+        # 要求显式 shard_map 包装，需要 mesh 传入模型层，属于架构级改动，待后续单独实现。
+        # dot_product_attention 期望 (B, L, H, D)，RoPE 后从 (B, H, L, D) 转换
+        q_t = jnp.transpose(q, (0, 2, 1, 3)).astype(compute_dtype)  # (B, L, H, D)
+        k_t = jnp.transpose(k, (0, 2, 1, 3)).astype(compute_dtype)  # (B, L, H_kv, D) — GQA 已展开
+        v_t = jnp.transpose(v, (0, 2, 1, 3)).astype(compute_dtype)
 
-        # Reshape: (B, H, L, D) -> (B, L, H*D)
-        attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
+        attn_output = jax.nn.dot_product_attention(
+            q_t, k_t, v_t,
+            bias=attention_mask,   # (B, 1, L, L) 加性 mask，broadcast 至各 head
+            scale=scaling,
+        )  # → (B, L, H, D)
+
+        # Reshape: (B, L, H, D) -> (B, L, H*D)
         attn_output = attn_output.reshape(B, L, -1)
 
         # Output projection

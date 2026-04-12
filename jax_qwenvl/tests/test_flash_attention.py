@@ -52,41 +52,42 @@ def ref_attention(q, k, v, mask=None):
 
 
 def flash_attention(q, k, v, mask=None):
-    """新实现（与生产代码逻辑一致）：Pallas mha_reference（CPU 可用）。
+    """生产代码实现（CPU 可测试版本）：jax.nn.dot_product_attention。
 
-    - 输入格式 (B, H, L, D)，与 Pallas TPU kernel 相同
-    - GQA：先展开 K/V（Pallas 不支持 GQA）
-    - ab：additive bias mask (B, 1, L, L)
-    CPU 下使用 mha_reference（纯 JAX，等价于 Pallas kernel 的参考实现）。
+    与生产代码（llm.py TextAttention）完全一致：
+    - GQA：先展开 K/V
+    - dtype：统一 cast
+    - 输入 (B, H, L, D) → transpose 到 (B, L, H, D) → dot_product_attention → transpose 回
     """
-    from jax.experimental.pallas.ops.tpu.flash_attention import mha_reference
-
     scaling = q.shape[-1] ** -0.5
     H = q.shape[1]
     H_kv = k.shape[1]
 
-    # GQA 展开
+    # GQA 展开（与生产代码一致）
     if H_kv < H:
         groups = H // H_kv
         k = jnp.repeat(k, groups, axis=1)
         v = jnp.repeat(v, groups, axis=1)
 
-    # 统一 dtype
+    # 统一 dtype（模拟 RoPE upcast 后 cast 回 compute_dtype）
     dtype = q.dtype
+    q = q.astype(dtype)
     k = k.astype(dtype)
     v = v.astype(dtype)
 
-    # Pallas kernel 要求精确形状 (B, H, L, L)，不接受 (B, 1, L, L) 广播
-    # 这里显式 broadcast，与生产代码中 jnp.broadcast_to 保持一致
-    H = q.shape[1]
-    L = q.shape[2]
-    ab_full = (jnp.broadcast_to(mask, (mask.shape[0], H, L, L))
-               if mask is not None else None)
-    return mha_reference(
-        q, k, v,
-        ab=ab_full,    # (B, H, L, L) 精确形状
-        sm_scale=scaling,
-    )  # → (B, H, L, D)
+    # dot_product_attention 期望 (B, L, H, D)
+    q_t = jnp.transpose(q, (0, 2, 1, 3))
+    k_t = jnp.transpose(k, (0, 2, 1, 3))
+    v_t = jnp.transpose(v, (0, 2, 1, 3))
+
+    out = jax.nn.dot_product_attention(
+        q_t, k_t, v_t,
+        bias=mask,     # (B, 1, L, L) — broadcast 至各 head
+        scale=scaling,
+        implementation="xla",  # CPU 测试用 XLA 参考实现
+    )  # → (B, L, H, D)
+
+    return jnp.transpose(out, (0, 2, 1, 3))  # → (B, H, L, D)
 
 
 def _causal_mask(L, dtype=jnp.bfloat16):
