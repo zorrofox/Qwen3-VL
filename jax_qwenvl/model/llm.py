@@ -102,28 +102,44 @@ class TextAttention(nn.Module):
         # Apply MRoPE
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # Flash Attention via jax.nn.dot_product_attention
-        # - 原生支持 GQA（无需 jnp.repeat 展开 K/V），节省 HBM
-        # - O(L) 内存，而非 O(L²)：L=8192 时 HBM 占用从 ~95% 降至 ~30%
-        # - 在 TPU(v6e/v7x) 上自动使用 Pallas Splash Attention 内核
-        # - 在 GPU 上自动使用 cuDNN Flash Attention
+        # Pallas Flash Attention（TPU）/ jax.nn.dot_product_attention（CPU/GPU 回退）
+        # 注意：RoPE (cos/sin float32) 让 q/k upcast 为 float32，v 仍是 bf16
+        # 统一 cast 后再计算
+        compute_dtype = hidden_states.dtype
         scaling = head_dim ** -0.5
 
-        # dot_product_attention 期望 (B, L, H, D)，RoPE 后从 (B, H, L, D) 转换
-        # 注意：RoPE (cos/sin float32) × q/k(bf16) → float32，v 未过 RoPE 仍是 bf16
-        # dot_product_attention 要求 q/k/v dtype 严格一致，统一转回训练 dtype
-        compute_dtype = hidden_states.dtype
-        q_t = jnp.transpose(q, (0, 2, 1, 3)).astype(compute_dtype)  # (B, L, H, D)
-        k_t = jnp.transpose(k, (0, 2, 1, 3)).astype(compute_dtype)  # (B, L, H_kv, D)
-        v_t = jnp.transpose(v, (0, 2, 1, 3)).astype(compute_dtype)
+        # GQA 展开：Pallas 不支持 GQA，dot_product_attention 支持但需要 cast
+        # 两条路都需要展开 K/V，保持一致
+        if num_kv_groups > 1:
+            k = jnp.repeat(k, num_kv_groups, axis=1)  # (B, H, L, D)
+            v = jnp.repeat(v, num_kv_groups, axis=1)
 
-        attn_output = jax.nn.dot_product_attention(
-            q_t, k_t, v_t,
-            bias=attention_mask,  # (B, 1, L, L) 加性 mask，broadcast 至各 head
-            scale=scaling,
-        )  # → (B, L, H, D)
+        q = q.astype(compute_dtype)
+        k = k.astype(compute_dtype)
+        v = v.astype(compute_dtype)
 
-        # Reshape: (B, L, H, D) -> (B, L, H*D)
+        if jax.default_backend() == "tpu":
+            # Pallas Flash Attention：真正的 O(L) 内存，ab 支持 additive mask
+            # 输入格式 (B, H, L, D)，与 RoPE 后一致，无需 transpose
+            from jax.experimental.pallas.ops.tpu import flash_attention as tpu_fa  # noqa
+            attn_output = tpu_fa.flash_attention(
+                q, k, v,
+                ab=attention_mask,  # (B, 1, L, L) broadcast 至 (B, H, L, L)
+                sm_scale=scaling,
+            )  # → (B, H, L, D)
+        else:
+            # CPU/GPU 回退：jax.nn.dot_product_attention
+            # 期望 (B, L, H, D)，需要 transpose
+            q_t = jnp.transpose(q, (0, 2, 1, 3))
+            k_t = jnp.transpose(k, (0, 2, 1, 3))
+            v_t = jnp.transpose(v, (0, 2, 1, 3))
+            attn_output = jax.nn.dot_product_attention(
+                q_t, k_t, v_t, bias=attention_mask, scale=scaling,
+            )  # → (B, L, H, D)
+            attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))  # → (B, H, L, D)
+
+        # Reshape: (B, H, L, D) -> (B, L, H*D)
+        attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
         attn_output = attn_output.reshape(B, L, -1)
 
         # Output projection

@@ -52,32 +52,35 @@ def ref_attention(q, k, v, mask=None):
 
 
 def flash_attention(q, k, v, mask=None):
-    """新实现：jax.nn.dot_product_attention。
+    """新实现（与生产代码逻辑一致）：Pallas mha_reference（CPU 可用）。
 
-    Args:
-        q: (B, H, L, D)     — 保持与 ref 相同的输入格式
-        k: (B, H_kv, L, D)  — 支持 GQA，无需 jnp.repeat
-        v: (B, H_kv, L, D)
-        mask: (B, 1, L, L) float 加性 mask
-    Returns:
-        (B, H, L, D)
+    - 输入格式 (B, H, L, D)，与 Pallas TPU kernel 相同
+    - GQA：先展开 K/V（Pallas 不支持 GQA）
+    - ab：additive bias mask (B, 1, L, L)
+    CPU 下使用 mha_reference（纯 JAX，等价于 Pallas kernel 的参考实现）。
     """
+    from jax.experimental.pallas.ops.tpu.flash_attention import mha_reference
+
     scaling = q.shape[-1] ** -0.5
-    B, H, L, D = q.shape
+    H = q.shape[1]
+    H_kv = k.shape[1]
 
-    # dot_product_attention 期望 (B, L, H, D)
-    q_t = jnp.transpose(q, (0, 2, 1, 3))
-    k_t = jnp.transpose(k, (0, 2, 1, 3))
-    v_t = jnp.transpose(v, (0, 2, 1, 3))
+    # GQA 展开
+    if H_kv < H:
+        groups = H // H_kv
+        k = jnp.repeat(k, groups, axis=1)
+        v = jnp.repeat(v, groups, axis=1)
 
-    out = jax.nn.dot_product_attention(
-        q_t, k_t, v_t,
-        bias=mask,   # (B, 1, L, L) 加性 mask，自动 broadcast 到各 head
-        scale=scaling,
-        implementation="xla",   # CPU 测试使用 XLA 参考实现
-    )  # → (B, L, H, D)
+    # 统一 dtype
+    dtype = q.dtype
+    k = k.astype(dtype)
+    v = v.astype(dtype)
 
-    return jnp.transpose(out, (0, 2, 1, 3))  # → (B, H, L, D)
+    return mha_reference(
+        q, k, v,
+        ab=mask,       # (B, 1, L, L) → broadcast 到 (B, H, L, L)
+        sm_scale=scaling,
+    )  # → (B, H, L, D)
 
 
 def _causal_mask(L, dtype=jnp.bfloat16):
