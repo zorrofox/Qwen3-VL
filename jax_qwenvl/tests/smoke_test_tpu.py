@@ -57,6 +57,12 @@ def test_splash_attention_under_shard_map():
             block_q=block_q,
             block_kv=block_kv,
             block_kv_compute=block_kv,
+            # 反向传播 block sizes（必须指定）
+            block_q_dkv=block_q,
+            block_kv_dkv=block_kv,
+            block_kv_dkv_compute=block_kv,
+            block_q_dq=block_q,
+            block_kv_dq=block_kv,
         ),
         head_shards=1,
         q_seq_shards=1,

@@ -144,12 +144,19 @@ class TextAttention(nn.Module):
             splash_kernel = _sak.make_splash_mha(
                 mask=multi_head_mask,
                 block_sizes=_sak.BlockSizes(
+                    # 前向 block sizes
                     block_q=block_q,
                     block_kv=block_kv,
                     block_kv_compute=block_kv,
+                    # 反向 block sizes（必须指定，否则 backward 报错）
+                    block_q_dkv=block_q,
+                    block_kv_dkv=block_kv,
+                    block_kv_dkv_compute=block_kv,
+                    block_q_dq=block_q,
+                    block_kv_dq=block_kv,
                 ),
-                head_shards=1,    # 本实现中 heads 不跨 mesh 轴分片
-                q_seq_shards=1,   # 本实现中序列不跨 mesh 轴分片
+                head_shards=1,
+                q_seq_shards=1,
             )
 
             def _splash_fn(q_l, k_l, v_l):
