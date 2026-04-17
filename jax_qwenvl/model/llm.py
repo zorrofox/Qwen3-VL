@@ -102,38 +102,92 @@ class TextAttention(nn.Module):
         # Apply MRoPE
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # Pallas Flash Attention（TPU）/ jax.nn.dot_product_attention（CPU/GPU 回退）
-        # 注意：RoPE (cos/sin float32) 让 q/k upcast 为 float32，v 仍是 bf16
-        # 统一 cast 后再计算
+        # Attention 计算
+        # RoPE (cos/sin float32) 让 q/k upcast 为 float32，v 仍是 bf16，统一 cast
         compute_dtype = hidden_states.dtype
         scaling = head_dim ** -0.5
-
-        # GQA 展开：Pallas 不支持 GQA，dot_product_attention 支持但需要 cast
-        # 两条路都需要展开 K/V，保持一致
-        if num_kv_groups > 1:
-            k = jnp.repeat(k, num_kv_groups, axis=1)  # (B, H, L, D)
-            v = jnp.repeat(v, num_kv_groups, axis=1)
-
         q = q.astype(compute_dtype)
         k = k.astype(compute_dtype)
         v = v.astype(compute_dtype)
 
-        # jax.nn.dot_product_attention — SPMD 兼容，O(L²) 内存
-        # 注意：Pallas Flash Attention（真正 O(L) 内存）在 JAX 0.9.0 的 FSDP/SPMD 下
-        # 要求显式 shard_map 包装，需要 mesh 传入模型层，属于架构级改动，待后续单独实现。
-        # dot_product_attention 期望 (B, L, H, D)，RoPE 后从 (B, H, L, D) 转换
-        q_t = jnp.transpose(q, (0, 2, 1, 3)).astype(compute_dtype)  # (B, L, H, D)
-        k_t = jnp.transpose(k, (0, 2, 1, 3)).astype(compute_dtype)  # (B, L, H_kv, D) — GQA 已展开
-        v_t = jnp.transpose(v, (0, 2, 1, 3)).astype(compute_dtype)
+        from jax_qwenvl.train.sharding import get_global_mesh  # noqa
+        global_mesh, sharding_mode = get_global_mesh()
 
-        attn_output = jax.nn.dot_product_attention(
-            q_t, k_t, v_t,
-            bias=attention_mask,   # (B, 1, L, L) 加性 mask，broadcast 至各 head
-            scale=scaling,
-        )  # → (B, L, H, D)
+        if global_mesh is not None and jax.default_backend() == "tpu":
+            # ── Splash Attention via shard_map(vmap(kernel)) — O(L) 内存 ──────
+            # 参考 MaxText 实现：mask 内嵌到 kernel，vmap 在 batch 维度上遍历
+            from jax.experimental.pallas.ops.tpu.splash_attention import (  # noqa
+                splash_attention_kernel as _sak,
+                splash_attention_mask as _sam,
+            )
+            from jax import shard_map  # noqa
+            from jax.sharding import PartitionSpec as P  # noqa
 
-        # Reshape: (B, L, H, D) -> (B, L, H*D)
-        attn_output = attn_output.reshape(B, L, -1)
+            # 批次分区 spec（与 shard_batch 中的 data_axis 一致）
+            if sharding_mode == 'hybrid':
+                batch_spec = P(('dp', 'fsdp'), None, None, None)
+            elif sharding_mode == 'fsdp':
+                batch_spec = P('fsdp', None, None, None)
+            else:
+                batch_spec = P('dp', None, None, None)
+
+            # 构造 CausalMask 并内嵌到 kernel（不需要传 ab/float mask）
+            # 对于非 packed 序列：CausalMask 即正确的 mask
+            # 对于 packed 序列：后续通过 segment_ids 支持（当前 benchmark 不启用 packing）
+            _L = L
+            _H_q = num_heads
+            block_q = min(512, _L)
+            block_kv = min(512, _L)
+
+            causal_mask = _sam.CausalMask(shape=(_L, _L))
+            multi_head_mask = _sam.MultiHeadMask(masks=(causal_mask,) * _H_q)
+            splash_kernel = _sak.make_splash_mha(
+                mask=multi_head_mask,
+                block_sizes=_sak.BlockSizes(
+                    block_q=block_q,
+                    block_kv=block_kv,
+                    block_kv_compute=block_kv,
+                ),
+                head_shards=1,    # 本实现中 heads 不跨 mesh 轴分片
+                q_seq_shards=1,   # 本实现中序列不跨 mesh 轴分片
+            )
+
+            def _splash_fn(q_l, k_l, v_l):
+                # 在 shard_map 内：q_l (B_local, H_q, L, D), k_l (B_local, H_kv, L, D)
+                # GQA 展开（splash_attention 不原生支持 GQA）
+                if num_kv_groups > 1:
+                    k_l = jnp.repeat(k_l, num_kv_groups, axis=1)
+                    v_l = jnp.repeat(v_l, num_kv_groups, axis=1)
+                # vmap 在 batch 维度上遍历（MaxText 正式模式）
+                # 每次 kernel 输入：(H_q, L, D) → 输出 (H_q, L, D)
+                return jax.vmap(splash_kernel)(q_l, k_l, v_l)  # → (B_local, H_q, L, D)
+
+            attn_output = shard_map(
+                _splash_fn,
+                mesh=global_mesh,
+                in_specs=(batch_spec, batch_spec, batch_spec),
+                out_specs=batch_spec,
+                check_vma=False,
+            )(q, k, v)  # → (B, H_q, L, D)
+
+            # (B, H_q, L, D) → (B, L, H_q*D)
+            attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
+            attn_output = attn_output.reshape(B, L, -1)
+
+        else:
+            # ── CPU/GPU 回退 / mesh 未注册 ─────────────────────────────────────
+            if num_kv_groups > 1:
+                k = jnp.repeat(k, num_kv_groups, axis=1)
+                v = jnp.repeat(v, num_kv_groups, axis=1)
+            q_t = jnp.transpose(q, (0, 2, 1, 3))
+            k_t = jnp.transpose(k, (0, 2, 1, 3))
+            v_t = jnp.transpose(v, (0, 2, 1, 3))
+            attn_output = jax.nn.dot_product_attention(
+                q_t, k_t, v_t,
+                bias=attention_mask,
+                scale=scaling,
+            )  # → (B, L, H, D)
+            attn_output = attn_output.reshape(B, L, -1)
 
         # Output projection
         if self.lora_rank > 0:

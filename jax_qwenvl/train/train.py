@@ -25,7 +25,7 @@ from jax_qwenvl.data.data_processor import LazySupervisedDataset, DataCollatorFo
 from jax_qwenvl.train.optimizer import create_optimizer
 from jax_qwenvl.train.train_state import create_train_state, TrainState
 from jax_qwenvl.train.train_step import train_step, train_step_with_accumulation
-from jax_qwenvl.train.sharding import create_device_mesh, get_param_sharding_rules, shard_params, shard_batch
+from jax_qwenvl.train.sharding import create_device_mesh, get_param_sharding_rules, shard_params, shard_batch, register_global_mesh
 from jax_qwenvl.train.checkpoint import CheckpointManager
 from jax_qwenvl.train.metrics_logger import MetricsLogger
 from jax_qwenvl.train.optimizer import create_schedule
@@ -328,6 +328,7 @@ def main():
         sharding_mode = 'dp'
     logger.info("Device mesh: dp=%d, fsdp=%d (mode=%s)",
                 mesh.shape['dp'], mesh.shape['fsdp'], sharding_mode)
+    register_global_mesh(mesh, sharding_mode)
 
     # 5. Initialize model
     lora_rank = training_args.lora_rank if training_args.lora_enable else 0
