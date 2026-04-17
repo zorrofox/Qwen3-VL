@@ -132,61 +132,42 @@ class TextAttention(nn.Module):
                 batch_spec = P('dp', None, None, None)
 
             # 构造 CausalMask 并内嵌到 kernel
+            # 注：曾尝试过 GQA via MQA + 双层 vmap 避免 jnp.repeat，
+            # 实测 HBM 与 jnp.repeat 完全相同（93%）、step_time 相同（K/V 展开
+            # 内存仅占总 HBM 的 0.05%，FFN intermediate 才是大头）。
+            # 故采用 jnp.repeat 简单实现。
             _L = L
             _H_q = num_heads
-            _H_kv = num_kv_heads
-            _G = num_kv_groups
             block_q = min(512, _L)
             block_kv = min(512, _L)
             causal_mask = _sam.CausalMask(shape=(_L, _L))
-            block_sizes_cfg = _sak.BlockSizes(
-                # 前向 block sizes
-                block_q=block_q,
-                block_kv=block_kv,
-                block_kv_compute=block_kv,
-                # 反向 block sizes（必须指定）
-                block_q_dkv=block_q,
-                block_kv_dkv=block_kv,
-                block_kv_dkv_compute=block_kv,
-                block_q_dq=block_q,
-                block_kv_dq=block_kv,
+            multi_head_mask = _sam.MultiHeadMask(masks=(causal_mask,) * _H_q)
+            splash_kernel = _sak.make_splash_mha(
+                mask=multi_head_mask,
+                block_sizes=_sak.BlockSizes(
+                    # 前向 block sizes
+                    block_q=block_q,
+                    block_kv=block_kv,
+                    block_kv_compute=block_kv,
+                    # 反向 block sizes（必须指定，否则 backward 报错）
+                    block_q_dkv=block_q,
+                    block_kv_dkv=block_kv,
+                    block_kv_dkv_compute=block_kv,
+                    block_q_dq=block_q,
+                    block_kv_dq=block_kv,
+                ),
+                head_shards=1,
+                q_seq_shards=1,
             )
 
-            if _G > 1:
-                # GQA 路径：用 MQA + vmap over KV groups（避免 jnp.repeat 4× 内存）
-                # 每个 KV 组：G 个 Q heads 共享 1 个 KV head（即 MQA 场景）
-                multi_head_mask_g = _sam.MultiHeadMask(masks=(causal_mask,) * _G)
-                splash_mqa_kernel = _sak.make_splash_mqa(
-                    mask=multi_head_mask_g,
-                    block_sizes=block_sizes_cfg,
-                    head_shards=1,
-                    q_seq_shards=1,
-                )
-
-                def _splash_fn(q_l, k_l, v_l):
-                    # q_l: (B_local, H_q, L, D), k_l/v_l: (B_local, H_kv, L, D)
-                    B_l = q_l.shape[0]
-                    # Q 重塑：(B_local, H_q=H_kv*G, L, D) → (B_local, H_kv, G, L, D)
-                    q_grouped = q_l.reshape(B_l, _H_kv, _G, _L, q_l.shape[-1])
-                    # 双层 vmap：外层 batch，内层 KV groups
-                    # 每次 MQA kernel 输入：q (G, L, D), k/v (L, D) → out (G, L, D)
-                    def per_batch(q_b, k_b, v_b):
-                        # q_b: (H_kv, G, L, D), k_b/v_b: (H_kv, L, D)
-                        return jax.vmap(splash_mqa_kernel, in_axes=(0, 0, 0))(q_b, k_b, v_b)
-                    out = jax.vmap(per_batch, in_axes=(0, 0, 0))(q_grouped, k_l, v_l)
-                    return out.reshape(B_l, _H_q, _L, q_l.shape[-1])
-            else:
-                # 标准 MHA：H_q == H_kv，无需展开
-                multi_head_mask = _sam.MultiHeadMask(masks=(causal_mask,) * _H_q)
-                splash_kernel = _sak.make_splash_mha(
-                    mask=multi_head_mask,
-                    block_sizes=block_sizes_cfg,
-                    head_shards=1,
-                    q_seq_shards=1,
-                )
-
-                def _splash_fn(q_l, k_l, v_l):
-                    return jax.vmap(splash_kernel)(q_l, k_l, v_l)
+            def _splash_fn(q_l, k_l, v_l):
+                # 在 shard_map 内：q_l (B_local, H_q, L, D), k_l (B_local, H_kv, L, D)
+                # GQA 展开（splash_attention 不原生支持 GQA）
+                if num_kv_groups > 1:
+                    k_l = jnp.repeat(k_l, num_kv_groups, axis=1)
+                    v_l = jnp.repeat(v_l, num_kv_groups, axis=1)
+                # vmap 在 batch 维度上遍历（MaxText 正式模式）
+                return jax.vmap(splash_kernel)(q_l, k_l, v_l)  # → (B_local, H_q, L, D)
 
             attn_output = shard_map(
                 _splash_fn,
