@@ -284,3 +284,90 @@ def test_output_shape():  # 原测试 6 → 现在是测试 7
 
     out = flash_attention(q, k, v)
     assert out.shape == (B, H, L, D), f"期望 {(B, H, L, D)}，得到 {out.shape}"
+
+
+# ---------------------------------------------------------------------------
+# 测试 9：GQA via MQA + vmap over KV groups（避免 jnp.repeat）
+# 验证新方案与 jnp.repeat 展开后的 MHA 数值一致
+# ---------------------------------------------------------------------------
+
+def test_gqa_via_mqa_vmap_equivalence():
+    """GQA 用 MQA + vmap over KV groups，与 jnp.repeat + MHA 数值等价。"""
+    from jax.experimental.pallas.ops.tpu.splash_attention import (
+        splash_attention_kernel as sak,
+        splash_attention_mask as sam,
+    )
+    # Qwen3-VL-8B 的 GQA 比例：32 Q heads, 8 KV heads, group=4
+    H_q, H_kv, L, D = 8, 2, 64, 16   # 缩小版
+    G = H_q // H_kv
+
+    key = jax.random.PRNGKey(42)
+    q = jax.random.normal(key, (H_q, L, D), dtype=jnp.bfloat16)
+    k = jax.random.normal(jax.random.fold_in(key, 1), (H_kv, L, D), dtype=jnp.bfloat16)
+    v = jax.random.normal(jax.random.fold_in(key, 2), (H_kv, L, D), dtype=jnp.bfloat16)
+
+    causal = sam.CausalMask(shape=(L, L))
+
+    # 方法 A：jnp.repeat 展开 + MHA reference
+    k_expanded = jnp.repeat(k, G, axis=0)  # (H_q, L, D)
+    v_expanded = jnp.repeat(v, G, axis=0)
+    mh_mask_full = sam.MultiHeadMask(masks=(causal,) * H_q)
+    ref_mha = sak.make_masked_mha_reference(mh_mask_full)
+    out_repeat = ref_mha(q, k_expanded, v_expanded, segment_ids=None)
+
+    # 方法 B：MQA + vmap over KV groups（不展开）
+    q_grouped = q.reshape(H_kv, G, L, D)   # (H_kv, G, L, D)
+    mh_mask_g = sam.MultiHeadMask(masks=(causal,) * G)
+    ref_mqa = sak.make_masked_mqa_reference(mh_mask_g)
+
+    out_grouped = jax.vmap(ref_mqa, in_axes=(0, 0, 0))(q_grouped, k, v)
+    out_vmap = out_grouped.reshape(H_q, L, D)
+
+    np.testing.assert_allclose(
+        np.array(out_vmap, dtype=np.float32),
+        np.array(out_repeat, dtype=np.float32),
+        atol=2e-2, rtol=2e-2,
+        err_msg="GQA via MQA+vmap 与 jnp.repeat+MHA 等价性失败"
+    )
+
+
+def test_gqa_via_mqa_vmap_with_batch():
+    """带 batch 维度：双层 vmap（外层 batch，内层 KV groups）。"""
+    from jax.experimental.pallas.ops.tpu.splash_attention import (
+        splash_attention_kernel as sak,
+        splash_attention_mask as sam,
+    )
+    B, H_q, H_kv, L, D = 2, 8, 2, 64, 16
+    G = H_q // H_kv
+
+    key = jax.random.PRNGKey(7)
+    q = jax.random.normal(key, (B, H_q, L, D), dtype=jnp.bfloat16)
+    k = jax.random.normal(jax.random.fold_in(key, 1), (B, H_kv, L, D), dtype=jnp.bfloat16)
+    v = jax.random.normal(jax.random.fold_in(key, 2), (B, H_kv, L, D), dtype=jnp.bfloat16)
+
+    causal = sam.CausalMask(shape=(L, L))
+
+    # 方法 A：jnp.repeat + 单层 vmap(MHA)
+    k_exp = jnp.repeat(k, G, axis=1)
+    v_exp = jnp.repeat(v, G, axis=1)
+    mh_mask = sam.MultiHeadMask(masks=(causal,) * H_q)
+    ref_mha = sak.make_masked_mha_reference(mh_mask)
+    out_a = jax.vmap(ref_mha, in_axes=(0, 0, 0))(q, k_exp, v_exp)
+
+    # 方法 B：双层 vmap（batch + groups）
+    q_grouped = q.reshape(B, H_kv, G, L, D)
+    mh_mask_g = sam.MultiHeadMask(masks=(causal,) * G)
+    ref_mqa = sak.make_masked_mqa_reference(mh_mask_g)
+
+    def per_batch(q_b, k_b, v_b):
+        return jax.vmap(ref_mqa, in_axes=(0, 0, 0))(q_b, k_b, v_b)
+
+    out_b_grouped = jax.vmap(per_batch, in_axes=(0, 0, 0))(q_grouped, k, v)
+    out_b = out_b_grouped.reshape(B, H_q, L, D)
+
+    np.testing.assert_allclose(
+        np.array(out_b, dtype=np.float32),
+        np.array(out_a, dtype=np.float32),
+        atol=2e-2, rtol=2e-2,
+        err_msg="batched GQA via MQA+vmap 等价性失败"
+    )

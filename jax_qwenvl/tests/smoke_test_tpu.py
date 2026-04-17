@@ -46,18 +46,19 @@ def test_splash_attention_under_shard_map():
     num_kv_groups = H_q // H_kv        # 4
     batch_spec = P(('dp', 'fsdp'), None, None, None)
 
-    # 3. 构造 Splash Attention kernel（CausalMask 内嵌，与生产代码完全一致）
+    # 3. 构造 Splash MQA kernel（GQA via MQA + vmap over KV groups）
+    G = H_q // H_kv  # 4
     block_q = min(512, L)
     block_kv = min(512, L)
     causal_mask = sam.CausalMask(shape=(L, L))
-    multi_head_mask = sam.MultiHeadMask(masks=(causal_mask,) * H_q)
-    splash_kernel = sak.make_splash_mha(
-        mask=multi_head_mask,
+    # 每个 KV 组有 G 个 Q heads 共享 1 个 KV head
+    multi_head_mask_g = sam.MultiHeadMask(masks=(causal_mask,) * G)
+    splash_mqa_kernel = sak.make_splash_mqa(
+        mask=multi_head_mask_g,
         block_sizes=sak.BlockSizes(
             block_q=block_q,
             block_kv=block_kv,
             block_kv_compute=block_kv,
-            # 反向传播 block sizes（必须指定）
             block_q_dkv=block_q,
             block_kv_dkv=block_kv,
             block_kv_dkv_compute=block_kv,
@@ -75,13 +76,18 @@ def test_splash_attention_under_shard_map():
     k = jax.device_put(jax.random.normal(jax.random.fold_in(key,1), (B_global, H_kv, L, D), dtype=jnp.bfloat16), sharding)
     v = jax.device_put(jax.random.normal(jax.random.fold_in(key,2), (B_global, H_kv, L, D), dtype=jnp.bfloat16), sharding)
 
-    # 5. shard_map(vmap(splash_kernel)) — 与 llm.py 完全相同路径
+    # 5. GQA via MQA + 双层 vmap（外层 batch，内层 KV groups）
+    # 不使用 jnp.repeat 展开，直接传 K/V 的 H_kv heads
     def _splash_fn(q_l, k_l, v_l):
-        # GQA 展开
-        k_l = jnp.repeat(k_l, num_kv_groups, axis=1)
-        v_l = jnp.repeat(v_l, num_kv_groups, axis=1)
-        # vmap 在 batch 维度上遍历（MaxText 正式模式）
-        return jax.vmap(splash_kernel)(q_l, k_l, v_l)
+        # q_l: (B_local, H_q=32, L, D), k_l/v_l: (B_local, H_kv=8, L, D)
+        B_l = q_l.shape[0]
+        # Q 重塑：(B_local, 32, L, D) → (B_local, 8, 4, L, D)
+        q_grouped = q_l.reshape(B_l, H_kv, G, L, D)
+        def per_batch(q_b, k_b, v_b):
+            # q_b: (H_kv, G, L, D), k_b/v_b: (H_kv, L, D)
+            return jax.vmap(splash_mqa_kernel, in_axes=(0, 0, 0))(q_b, k_b, v_b)
+        out = jax.vmap(per_batch, in_axes=(0, 0, 0))(q_grouped, k_l, v_l)
+        return out.reshape(B_l, H_q, L, D)
 
     logger.info("运行 shard_map(vmap(splash_kernel)) forward (B=%d H_q=%d H_kv=%d L=%d D=%d) ...",
                 B_global, H_q, H_kv, L, D)
