@@ -18,6 +18,20 @@
 
 set -euo pipefail
 
+# ── XLA/LIBTPU 优化 flag（Ironwood v7x 推荐配置）────────────────────────────
+# 参考：https://docs.cloud.google.com/tpu/docs/ironwood-performance
+#       https://github.com/AI-Hypercomputer/tpu-recipes/tree/main/training/ironwood
+export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-} \
+  --xla_tpu_scoped_vmem_limit_kib=98304 \
+  --xla_tpu_enable_async_collective_fusion=true \
+  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true \
+  --xla_tpu_enable_async_collective_fusion_multiple_steps=true \
+  --xla_tpu_overlap_compute_collective_tc=true \
+  --xla_enable_async_all_gather=true \
+  --xla_tpu_enable_data_parallel_all_reduce_opt=true \
+  --xla_tpu_data_parallel_opt_different_sized_ops=true \
+  --xla_tpu_use_enhanced_launch_barrier=true"
+
 # Model configuration
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-2B-Instruct}"
 DATASETS="${DATASETS:-cambrian_737k}"
