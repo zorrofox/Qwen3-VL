@@ -1,0 +1,50 @@
+# Qwen3-VL-8B model config for MaxText
+# Based on: https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct/blob/main/config.json
+#
+# Text decoder: qwen3-8b.yml is nearly identical, only rope_theta differs
+# Vision encoder: Qwen3-VL ViT（depth=27, hidden=1152, patch=16）
+
+# ── Text Decoder ────────────────────────────────────────────────────────────
+base_emb_dim: 4096
+base_num_query_heads: 32
+base_num_kv_heads: 8
+base_mlp_dim: 12288
+base_num_decoder_layers: 36
+head_dim: 128
+mlp_activations: ["silu", "linear"]
+vocab_size: 151936
+
+decoder_block: "qwen3"
+
+normalization_layer_epsilon: 1.0e-6
+rope_max_timescale: 5000000    # Qwen3-VL uses 5M, not 1M like base Qwen3-8B
+
+use_qk_norm: True
+logits_via_embedding: False
+normalize_embedding_logits: False
+enable_dropout: False
+scan_layers: False              # deepstack requires scan_layers=False
+
+# ── Vision Encoder (Qwen3-VL ViT) ──────────────────────────────────────────
+# Exactly matches vision_config in Qwen3-VL-8B-Instruct/config.json
+hidden_size_for_vit: 1152
+intermediate_size_for_vit: 4304
+num_attention_heads_for_vit: 16
+num_hidden_layers_for_vit: 27
+num_channels_for_vit: 3
+patch_size_for_vit: 16
+temporal_patch_size_for_vit: 2
+spatial_merge_size_for_vit: 2
+out_hidden_size_for_vit: 4096
+num_position_embeddings_for_vit: 2304
+deepstack_visual_indexes_for_vit: [8, 16, 24]
+
+# ── Multimodal Settings ─────────────────────────────────────────────────────
+use_multimodal: true
+use_audio: false
+
+# MRoPE for vision-language alignment
+use_mrope: true
+mrope_section: [24, 20, 20]
+
+tokenizer_type: "huggingface"
