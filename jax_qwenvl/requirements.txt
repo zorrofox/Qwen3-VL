@@ -1,34 +1,15 @@
-# JAX/TPU training dependencies for Qwen3-VL
-# Requires Python 3.11+ (JAX 0.7.0+ dropped Python 3.10)
-# On v2-alpha-tpuv6e runtime (Python 3.10), create a venv first:
-#   sudo apt install python3.11 python3.11-venv python3.11-dev
-#   python3.11 -m venv ~/venv311 && source ~/venv311/bin/activate
-# Install JAX with TPU support:
-#   pip install 'jax[tpu]==0.9.0' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+# Qwen3-VL MaxText SFT 依赖
+# 训练框架通过 MaxText 提供，本目录只需数据管道依赖
 
-jax[tpu]==0.9.0
-flax>=0.12.0
-optax>=0.2.5
-orbax-checkpoint>=0.11.32
+# MaxText（含 JAX、Flax、Orbax、Pallas 等）
+# 安装：pip install -e /path/to/maxtext-qwen3vl
 
-transformers>=5.0.0
-accelerate>=1.10.0
-huggingface_hub>=1.0.0
-tokenizers>=0.22.0
-safetensors>=0.7.0
-jinja2>=3.1.0
+# 数据管道（llava_dataset.py）
+datasets>=2.18.0
+pillow>=10.0.0
+google-cloud-storage>=2.19.0
 
-pillow>=12.0.0
-numpy>=2.0.0
-scipy>=1.15.0
-
-# Vision processing
-qwen-vl-utils>=0.0.14
-torchvision>=0.25.0
-
-# Logging (optional)
-wandb>=0.24.0
-tensorboard>=2.20.0
-google-cloud-storage>=2.19.0  # GCS upload via native SDK
-gcsfs>=2024.0.0  # Required by Orbax/etils for GCS checkpoint paths
-qwix>=0.1.6  # FP8/INT8 quantization for JAX/Flax (Google)
+# 权重转换（convert_qwen3vl.py）
+safetensors>=0.4.0
+torch>=2.0.0       # CPU only，仅用于加载 safetensors
+tqdm>=4.66.0
