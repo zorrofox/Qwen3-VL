@@ -147,12 +147,32 @@ def build_vision_mapping(num_vit_layers: int, num_heads: int, head_dim: int,
     return mapping
 
 
-# ── 加载 HF safetensors ────────────────────────────────────────────────────
+# ── 加载 HF safetensors（懒加载，按文件流式处理）─────────────────────────
+
+def iter_hf_weights(model_path: str):
+    """逐文件 yield (key, numpy_array)，峰值 RAM ≈ 单个文件大小（~4-5GB）。"""
+    if model_path.startswith("gs://"):
+        import subprocess, tempfile
+        tmp = tempfile.mkdtemp()
+        files = sorted(glob.glob(os.path.join(tmp, "model-*.safetensors")))
+        if not files:
+            subprocess.run(
+                ["gcloud", "storage", "cp", f"{model_path}/model-*.safetensors", tmp],
+                check=True
+            )
+            files = sorted(glob.glob(os.path.join(tmp, "model-*.safetensors")))
+    else:
+        files = sorted(glob.glob(os.path.join(model_path, "model-*.safetensors")))
+
+    for path in tqdm(files, desc="处理 safetensors 文件"):
+        with safe_open(path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                yield key, f.get_tensor(key).float().numpy()
+
 
 def load_hf_weights(model_path: str) -> dict:
-    """从本地或 GCS 路径加载所有 safetensors 文件。"""
+    """一次性加载所有权重（内存充足时使用）。"""
     if model_path.startswith("gs://"):
-        # 下载到临时目录
         import subprocess, tempfile
         tmp = tempfile.mkdtemp()
         subprocess.run(["gcloud", "storage", "cp", "-r", f"{model_path}/*.safetensors", tmp], check=True)
@@ -171,80 +191,95 @@ def load_hf_weights(model_path: str) -> dict:
 
 # ── 主转换逻辑 ────────────────────────────────────────────────────────────
 
+def _apply_mapping(hf_k: str, w: np.ndarray, mt_k: str, op,
+                   params: dict, maxtext_weights: dict):
+    """将单个 HF 权重应用映射写入 maxtext_weights。"""
+    num_heads    = params["num_attention_heads"]
+    num_kv_heads = params["num_key_value_heads"]
+    vit_hs       = params["vit_hidden_size"]
+
+    if "SPLIT_QKV" in mt_k:
+        is_bias = "BIAS" in mt_k
+        base_mt = mt_k.replace("SPLIT_QKV_BIAS", "").replace("SPLIT_QKV", "")
+        head_dim = params["head_dim"]
+        if not is_bias:
+            q, k, v = np.split(w, [
+                num_heads * head_dim,
+                num_heads * head_dim + num_kv_heads * head_dim,
+            ], axis=0)
+            maxtext_weights[f"{base_mt}attn.query.kernel"] = q.T
+            maxtext_weights[f"{base_mt}attn.key.kernel"]   = k.T
+            maxtext_weights[f"{base_mt}attn.value.kernel"] = v.T
+        else:
+            maxtext_weights[f"{base_mt}attn.query.bias"] = w[:vit_hs]
+            maxtext_weights[f"{base_mt}attn.key.bias"]   = w[vit_hs:2*vit_hs]
+            maxtext_weights[f"{base_mt}attn.value.bias"] = w[2*vit_hs:]
+    elif op is True:
+        maxtext_weights[mt_k] = w.T
+    else:
+        maxtext_weights[mt_k] = w
+
+
+def convert_lazy(model_path: str, params: dict) -> dict:
+    """懒加载转换：逐文件处理，峰值 RAM ≈ 单文件大小（~4GB）。"""
+    num_layers     = params["num_hidden_layers"]
+    num_vit_layers = params["num_vit_layers"]
+    vit_num_heads  = params["vit_num_heads"]
+    head_dim       = params["head_dim"]
+    deepstack_idxs = params["deepstack_indexes"]
+
+    full_map = {
+        **build_text_mapping(num_layers),
+        **build_vision_mapping(num_vit_layers, vit_num_heads, head_dim, deepstack_idxs),
+    }
+
+    maxtext_weights = {}
+    unmapped = []
+    for hf_k, w in iter_hf_weights(model_path):
+        if hf_k in full_map:
+            mt_k, op = full_map[hf_k]
+            _apply_mapping(hf_k, w, mt_k, op, params, maxtext_weights)
+        else:
+            unmapped.append(hf_k)
+        del w  # 立即释放
+
+    if unmapped:
+        print(f"\n⚠️  {len(unmapped)} 个 HF key 未映射：{unmapped[:5]}")
+    print(f"懒加载转换完成：{len(maxtext_weights)} 个 MaxText 权重张量")
+    return maxtext_weights
+
+
 def convert(hf_weights: dict, params: dict, dry_run: bool = False) -> Optional[dict]:
-    """
-    执行 HF → MaxText 权重转换。
-    dry_run=True 时只打印映射关系，不构建输出 dict。
-    """
-    num_layers      = params["num_hidden_layers"]
-    num_heads       = params["num_attention_heads"]
-    num_kv_heads    = params["num_key_value_heads"]
-    head_dim        = params["head_dim"]
-    num_vit_layers  = params["num_vit_layers"]
-    vit_num_heads   = params["vit_num_heads"]
-    deepstack_idxs  = params["deepstack_indexes"]
+    """一次性转换（内存充足时使用）。dry_run=True 只打印映射。"""
+    num_layers     = params["num_hidden_layers"]
+    num_vit_layers = params["num_vit_layers"]
+    vit_num_heads  = params["vit_num_heads"]
+    head_dim       = params["head_dim"]
+    deepstack_idxs = params["deepstack_indexes"]
 
     text_map   = build_text_mapping(num_layers)
     vision_map = build_vision_mapping(num_vit_layers, vit_num_heads, head_dim, deepstack_idxs)
     full_map   = {**text_map, **vision_map}
 
-    # 检查 HF 中有哪些 key 未被映射
-    mapped_hf_keys = set(full_map.keys())
-    # 去掉 SPLIT_QKV 标记（这些是特殊处理）
-    all_hf_keys = set(hf_weights.keys())
-    # qkv split 的原始 key
-    split_qkv_hf = {k for k, (mt_k, _) in full_map.items() if "SPLIT_QKV" in mt_k}
-    unmapped = all_hf_keys - mapped_hf_keys
+    unmapped = set(hf_weights.keys()) - set(full_map.keys())
     if unmapped:
-        print(f"\n⚠️  {len(unmapped)} 个 HF key 未映射（可能是多余的或需要补充）：")
-        for k in sorted(unmapped)[:20]:
-            print(f"   {k}")
+        print(f"\n⚠️  {len(unmapped)} 个 HF key 未映射：{sorted(unmapped)[:5]}")
 
     if dry_run:
-        print("\n=== DRY RUN 映射预览 ===")
-        for hf_k, (mt_k, op) in sorted(full_map.items())[:20]:
-            shape = hf_weights[hf_k].shape if hf_k in hf_weights else "NOT FOUND"
-            print(f"  {hf_k} → {mt_k}  [op={op}, shape={shape}]")
-        print(f"\n共 {len(full_map)} 个映射规则（文本: {len(text_map)}，视觉: {len(vision_map)}）")
+        print("\n=== DRY RUN 映射预览（前20条）===")
+        for hf_k, (mt_k, op) in list(full_map.items())[:20]:
+            shape = hf_weights.get(hf_k, np.array([])).shape
+            print(f"  {hf_k}\n    → {mt_k}  [{op}]  {shape}")
+        print(f"\n共 {len(full_map)} 条映射（文本: {len(text_map)}，视觉: {len(vision_map)}）")
         return None
 
-    # 实际转换
     maxtext_weights = {}
     for hf_k, (mt_k, op) in tqdm(full_map.items(), desc="转换权重"):
         if hf_k not in hf_weights:
-            print(f"  ⚠️  跳过（HF 中不存在）: {hf_k}")
             continue
-        w = hf_weights[hf_k]
+        _apply_mapping(hf_k, hf_weights[hf_k], mt_k, op, params, maxtext_weights)
 
-        if "SPLIT_QKV" in mt_k:
-            # fused qkv → 拆分 q, k, v
-            # HF shape: (3 * num_heads * head_dim, hidden) 或 (3 * hidden,)
-            is_bias = "BIAS" in mt_k
-            base_mt = mt_k.replace("SPLIT_QKV_BIAS", "").replace("SPLIT_QKV", "")
-            if not is_bias:
-                # weight: (3*H*D, hidden_size)
-                q, k, v = np.split(w, [
-                    num_heads * head_dim,
-                    num_heads * head_dim + num_kv_heads * head_dim,
-                ], axis=0)
-                maxtext_weights[f"{base_mt}attn.query.kernel"] = q.T   # (H*D, hidden) → transpose
-                maxtext_weights[f"{base_mt}attn.key.kernel"]   = k.T
-                maxtext_weights[f"{base_mt}attn.value.kernel"] = v.T
-            else:
-                # bias: (3*H*D,)
-                vit_hs = params["vit_hidden_size"]
-                q_b = w[:vit_hs]
-                k_b = w[vit_hs:2*vit_hs]
-                v_b = w[2*vit_hs:]
-                maxtext_weights[f"{base_mt}attn.query.bias"] = q_b
-                maxtext_weights[f"{base_mt}attn.key.bias"]   = k_b
-                maxtext_weights[f"{base_mt}attn.value.bias"] = v_b
-        elif op is True:
-            maxtext_weights[mt_k] = w.T
-        else:
-            maxtext_weights[mt_k] = w
-
-    print(f"\n转换完成：{len(maxtext_weights)} 个 MaxText 权重张量")
+    print(f"转换完成：{len(maxtext_weights)} 个 MaxText 权重张量")
     return maxtext_weights
 
 
@@ -276,19 +311,29 @@ def main():
     parser.add_argument("--hf_model_path",  required=True,  help="HF 权重路径（本地或 gs://）")
     parser.add_argument("--output_path",    required=True,  help="MaxText Orbax 输出路径（gs://）")
     parser.add_argument("--model_size",     default="qwen3vl-8b")
-    parser.add_argument("--dry_run",        default="True",  help="只验证映射，不写文件")
+    parser.add_argument("--dry_run", default="True",  help="只验证映射，不写文件")
+    parser.add_argument("--lazy",    default="True",  help="懒加载（推荐，峰值 RAM ~4GB）")
     args = parser.parse_args()
 
     dry_run = args.dry_run.lower() in ("true", "1", "yes")
+    lazy    = args.lazy.lower()    in ("true", "1", "yes")
     params  = MODEL_PARAMS[args.model_size]
 
-    print(f"加载 HF 权重：{args.hf_model_path}")
-    hf_weights = load_hf_weights(args.hf_model_path)
-
-    maxtext_weights = convert(hf_weights, params, dry_run=dry_run)
-
-    if not dry_run and maxtext_weights:
+    if dry_run:
+        # dry_run 时仍需加载权重来显示 shape，但可以只加载第一个文件
+        print(f"DRY RUN：加载 HF 权重（仅验证映射）...")
+        hf_weights = load_hf_weights(args.hf_model_path)
+        convert(hf_weights, params, dry_run=True)
+    elif lazy:
+        print(f"懒加载模式（峰值 RAM ≈ 4GB）：{args.hf_model_path}")
+        maxtext_weights = convert_lazy(args.hf_model_path, params)
         save_orbax(maxtext_weights, args.output_path)
+    else:
+        print(f"全量加载（需要 ~32GB RAM）：{args.hf_model_path}")
+        hf_weights = load_hf_weights(args.hf_model_path)
+        maxtext_weights = convert(hf_weights, params)
+        if maxtext_weights:
+            save_orbax(maxtext_weights, args.output_path)
 
 
 if __name__ == "__main__":
