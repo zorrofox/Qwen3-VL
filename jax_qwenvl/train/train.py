@@ -95,6 +95,7 @@ class TrainingArguments:
     run_name: str = ""
     warmup_ratio: float = 0.0
     logging_dir: Optional[str] = None  # tensorboard log dir (supports GCS paths); defaults to output_dir
+    enable_fp8: bool = False  # FP8 量化训练（Qwix）：节省 HBM 激活缓冲区，允许更大 batch
     gcs_output_dir: Optional[str] = None  # GCS path for model/checkpoint upload (e.g. gs://bucket/path)
 
 
@@ -339,6 +340,23 @@ def main():
         lora_alpha=lora_alpha,
         gradient_checkpointing=training_args.gradient_checkpointing,
     )
+
+    # 5.5 FP8 量化（可选）：用 Qwix 对所有 Dense 层启用 FP8，减少 HBM 激活缓冲区
+    if training_args.enable_fp8:
+        try:
+            import qwix  # noqa
+            rules = [
+                qwix.QuantizationRule(
+                    # 对所有 Dense 层（FFN gate/up/down、QKV、O_proj）启用 FP8
+                    module_path=r'.*Dense.*',
+                    weight_qtype='fp8',   # E4M3FN weight 量化
+                    act_qtype='fp8',      # E4M3FN activation 量化
+                )
+            ]
+            model = qwix.quantize_model(model, qwix.QtProvider(rules))
+            logger.info("FP8 quantization enabled via Qwix (W8A8 FP8 for all Dense layers)")
+        except ImportError:
+            logger.warning("qwix not installed, FP8 skipped. Install: pip install qwix>=0.1.6")
 
     # 6. Load weights from HuggingFace safetensors
     import time as _time
@@ -617,10 +635,20 @@ def main():
                     # Compute token count before train_step (batch may be donated)
                     total_tokens = int(batch.attention_mask.sum())
 
+                    # Profiling：在稳态步骤（跳过编译）收集 trace
+                    profile_dir = os.environ.get("JAX_PROFILE_DIR", "")
+                    if profile_dir and global_step == 3 and is_main_process:
+                        jax.profiler.start_trace(profile_dir)
+                        logger.info("Profiler started at step %d → %s", global_step, profile_dir)
+
                     step_t0 = time.time()
                     state, metrics = train_step(state, batch)
                     jax.block_until_ready(metrics["loss"])
                     step_elapsed = time.time() - step_t0
+
+                    if profile_dir and global_step == 8 and is_main_process:
+                        jax.profiler.stop_trace()
+                        logger.info("Profiler stopped at step %d", global_step)
 
                     loss_val = float(metrics["loss"])
                     epoch_loss += loss_val

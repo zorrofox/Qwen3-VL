@@ -136,9 +136,10 @@ spec:
           MAX_STEPS=30 \
           MAX_PIXELS=50176 \
           MODEL_MAX_LENGTH=8192 \
+          ENABLE_FP8=True \
           GCS_OUTPUT_DIR=gs://YOUR_GCS_BUCKET/qwen3vl-8b-v7x-test \
           REPORT_TO=tensorboard \
-          RUN_NAME=qwen3vl-8b-v7x16-L8192-bench \
+          RUN_NAME=qwen3vl-8b-v7x16-L8192-fp8-bench \
           SAVE_STEPS=9999 \
           bash jax_qwenvl/scripts/train_tpu.sh
 
@@ -155,6 +156,8 @@ spec:
           value: "${HF_TOKEN}"  # 从 Kubernetes Secret 或环境变量注入，禁止硬编码
         - name: HF_HUB_ENABLE_HF_TRANSFER
           value: "1"
+        - name: JAX_PROFILE_DIR
+          value: "gs://YOUR_GCS_BUCKET/profiles/"
         resources:
           requests:
             google.com/tpu: 4    # 仅请求 TPU，不请求 CPU/memory（避免 optimize-utilization-scheduler 注入 cpu-np nodeSelector）

@@ -86,6 +86,10 @@ LORA_ENABLE="${LORA_ENABLE:-False}"
 LORA_RANK="${LORA_RANK:-64}"
 LORA_ALPHA="${LORA_ALPHA:-128}"
 
+# FP8 量化训练（Qwix）：节省 HBM，允许更大 batch size
+# 预期：激活缓冲区减少 ~50%，HBM 从 93% 降到 ~55%，可支持 batch=4
+ENABLE_FP8="${ENABLE_FP8:-False}"
+
 echo "=== JAX Qwen3-VL Training ==="
 echo "Model:      ${MODEL_PATH}"
 echo "Datasets:   ${DATASETS}"
@@ -137,6 +141,7 @@ python3 -m jax_qwenvl.train.train \
     --lora_enable "${LORA_ENABLE}" \
     --lora_rank "${LORA_RANK}" \
     --lora_alpha "${LORA_ALPHA}" \
+    --enable_fp8 "${ENABLE_FP8}" \
     --bf16 True \
     --logging_steps 1 \
     --seed 42 \
