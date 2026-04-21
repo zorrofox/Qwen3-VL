@@ -298,6 +298,55 @@ jax_qwenvl/model/llm.py TextAttention:
 | 8B XLA, L=8192 | GKE v7x-16 | 5.22s | ~1.9k | **95.8%** | 1.82（30步）|
 | 8B Pallas shard_map, L=8192 | GKE v7x-16 | 29.6s | ~300 | — | 1.82（30步）|
 
+### 7.1 单 host 8 dev（lustre PVC + XLA flags）batch / FP8 矩阵
+
+集群：`bodaborg-tpu7x-auto-nap2`（cloud-tpu-multipod-dev, us-central1-c）  
+拓扑：`tpu7x` 2x2x1 单 host（8 JAX dev = 4 chips × 2 cores）  
+Mesh：dp=2, fsdp=4（hybrid）  
+数据：lustre PVC 直挂（`/data/qwen3vl/llava_data/`，无运行时 zip 解压）  
+模型：Qwen3-VL-8B-Instruct，bf16，L=1024，max_pixels=50176  
+XLA flags：MaxText 推荐 + sparse_core_collective_offload
+
+| Phase | quant | per_dev_batch | global_batch | step_time | tokens/s | samples/s | HBM peak/192GiB | avg_loss(30步) |
+|-------|-------|--------------|--------------|-----------|----------|-----------|----------------|---------------|
+| A | bf16 | 2 | 16 | 0.56s | ~8.5k | 28.6 | — | 2.537 |
+| B | bf16 | 4 | 32 | 0.75s | ~12.5k | 42.7 | 128 GiB（67%） | 2.525 |
+| C | bf16 | 8 | 64 | 1.45s | ~12.5k | 44.1 | 128 GiB（67%）* | 2.534 |
+| **D（sweet spot）** | **fp8 e4m3fn** | **4** | **32** | **0.71s** | **~13.3k** | **45.1** | **87 GiB（45.5%）** | **2.549** |
+| E | fp8 e4m3fn | 8 | 64 | 1.37s | ~13.5k | 46.7 | 126 GiB（66%） | 2.572 |
+
+> \* Cloud Monitoring `kubernetes.io/node/accelerator/memory_used`：4 物理芯片 mean 112 / max 128 GiB（每物理芯片 192 GiB，其中 2 JAX dev 共享）。
+
+**FP8 配置（Qwix QT, jax.numpy.float8_e4m3fn）**：
+- 量化范围：仅 LLM decoder 36 层的 attention `{q,k,v,o}_proj` + FFN `{gate,up,down}_proj`（共 252 个 kernel）
+- 不量化：visual ViT 27 层、deepstack mergers、patch_embed、lm_head（数值敏感 / 收益小）
+- 上次失败原因（`f30026f`）：`module_path=r'.*Dense.*'` 匹配 Flax 类名而非 instance name；`weight_qtype='fp8'` 字符串无效
+- 本次修对：`module_path=r'.*(q_proj|...|down_proj)$'` + `jnp.float8_e4m3fn` dtype 对象
+- 验证：`jax.make_jaxpr(model.apply)` 扫描 forward 图中 `float8` op 出现次数
+
+**结论**：
+- batch=2→4（bf16）：tokens/s 1.47×（8.5k→12.5k），step_time 1.34×（0.56→0.75）。**有效收益**。
+- batch=4→8（bf16）：step_time 1.93×（0.75→1.45），tokens/s **完全持平**（~12.5k）。**compute bound**。
+- **FP8 vs BF16（同 batch=4）**：step_time -5.3%（0.75→0.71），tokens/s +6.4%（12.5k→13.3k），**HBM peak -32%（128→87 GiB）**，loss +0.024（可接受）。FP8 在 v7x TC 上**真生效**（HBM 大幅下降是硬证据），但 step_time 增益小——因为量化只覆盖 LLM Dense（68% kernels），剩下 32% 的 vision tower 是 compute 主瓶颈。
+- **FP8+batch=8 没拿到额外收益**：step_time 1.37s（vs FP8+bs4 0.71s 的 1.93×），tokens/s ~13.5k 与 FP8+bs4 持平 → 同样 compute bound，HBM 余量被 batch 翻倍消化。
+- 真要再推 throughput 必须把 FP8 扩到 ViT，或者拼 16 dev 拓扑（host 内 FSDP 通信自由，加 host 数线性放大）。
+
+**复现命令**：
+```bash
+# 一次性：lustre 数据 staging
+kubectl apply -f jax_qwenvl/gke/lustre-stage-llava.yaml
+kubectl wait --for=condition=complete --timeout=900s job/lustre-stage-llava -n default
+
+# 训练（编辑 yaml 内 BATCH_SIZE / RUN_NAME / ENABLE_FP8）
+kubectl apply -f jax_qwenvl/gke/qwen3vl-8b-v7x-train-fast.yaml
+kubectl logs -f -n default -l app=qwen3vl-v7x-fast
+
+# 修 Qwix pattern：先 PRINT_MODULE_PATHS=1 ENABLE_FP8=False 跑一次拿 path 命名，
+# 再据此写 train.py 里的 module_path 正则；启动前 jaxpr 扫描会验证 float8 op 是否存在
+```
+
+下一步推 throughput 的剩余杠杆：(a) 拿 2 个 v7x 节点拼 2x2x2（16 dev，目标 FP8 下 ~25k tok/s）；(b) FP8 扩展到 visual ViT（`visual/blocks_*/{linear_fc1,linear_fc2,attn/qkv,attn/proj}` pattern），覆盖剩下 32% kernels；(c) 视觉 tower 的 attention 接 splash_attention（vision compute bound 的根源）。
+
 ---
 
 *参考资料：*
