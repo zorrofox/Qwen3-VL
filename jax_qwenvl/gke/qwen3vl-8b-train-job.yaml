@@ -1,0 +1,125 @@
+# Qwen3-VL 8B 训练 Job — GKE v6e-16 (asia-northeast1-b)
+#
+# 前提条件（一次性设置）：
+#   1. 集群启用 Workload Identity:
+#      gcloud container clusters update tpu-v6e-cluster --location=asia-northeast1-b \
+#        --workload-pool=YOUR_GCP_PROJECT.svc.id.goog
+#   2. 节点池创建时加 --workload-metadata=GKE_METADATA
+#   3. 创建并绑定 SA（见 CLAUDE.md GKE 章节）:
+#      - GSA: tpu-trainer-sa@YOUR_GCP_PROJECT.iam.gserviceaccount.com
+#        已授权 roles/storage.objectAdmin on gs://YOUR_GCS_BUCKET_ASIA
+#      - KSA: tpu-trainer-ksa (default namespace)
+#        已注解 iam.gke.io/gcp-service-account=tpu-trainer-sa@YOUR_GCP_PROJECT.iam.gserviceaccount.com
+#   4. 上传代码: tar czf /tmp/jax_qwenvl.tar.gz jax_qwenvl/ &&
+#               gcloud storage cp /tmp/jax_qwenvl.tar.gz gs://YOUR_GCS_BUCKET_ASIA/code/
+#
+# 已验证结果 (2026-04-05):
+#   step_time=0.78s | tokens/s=~12.4k | avg_loss=1.82 (30步)
+#   — 与 GCE TPU VM 基准一致
+#
+# 注意事项:
+#   - 容器默认 Python 3.12，必须建 Python 3.11 venv（否则 XLA 编译静默崩溃）
+#   - 依赖通过 requirements.txt 完整安装，不手动挑包
+#   - 数据集用 zip 下载（比 118K 散文件快）+ Python zipfile 解压
+#   - GCS 写权限来自 Workload Identity，不依赖节点 SA scope
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen3vl-headless-svc
+spec:
+  clusterIP: None
+  selector:
+    job-name: qwen3vl-8b-train
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen3vl-8b-train
+spec:
+  backoffLimit: 0
+  completions: 4       # 等于 v6e-16 节点数（4x4 拓扑 = 4 节点）
+  parallelism: 4
+  completionMode: Indexed
+  template:
+    spec:
+      subdomain: qwen3vl-headless-svc  # 必须与 Service name 一致，GKE 据此生成 TPU_WORKER_HOSTNAMES
+      restartPolicy: Never
+      serviceAccountName: tpu-trainer-ksa  # Workload Identity KSA，具有 GCS 写权限
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice  # 注意：GKE 实际 label 值非 podslice
+        cloud.google.com/gke-tpu-topology: 4x4
+      containers:
+      - name: trainer
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest
+        command:
+        - bash
+        - -c
+        - |
+          set -euo pipefail
+          echo "=== [$(date)] Pod ${JOB_COMPLETION_INDEX} starting ==="
+
+          # 1. 下载代码
+          echo "=== [$(date)] Downloading jax_qwenvl code ==="
+          mkdir -p /workspace && cd /workspace
+          gcloud storage cp gs://YOUR_GCS_BUCKET_ASIA/code/jax_qwenvl.tar.gz .
+          tar xzf jax_qwenvl.tar.gz
+
+          # 2. 安装 Python 3.11 + 依赖（必须用 3.11，容器默认 3.12 与训练代码不兼容）
+          echo "=== [$(date)] Installing Python 3.11 and dependencies ==="
+          apt-get update -qq
+          apt-get install -y -qq python3.11 python3.11-venv python3.11-dev
+          python3.11 -m venv /opt/venv311
+          source /opt/venv311/bin/activate
+          pip install --quiet "jax[tpu]==0.9.0" \
+            -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+          pip install --quiet -r jax_qwenvl/requirements.txt \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+
+          # 3. 下载数据集（zip 比 118K 散文件快；用 Python zipfile 解压，容器无 unzip）
+          echo "=== [$(date)] Downloading dataset ==="
+          mkdir -p /data/llava
+          gcloud storage cp \
+            gs://YOUR_GCS_BUCKET/datasets/llava_data/llava_instruct_150k.json \
+            /data/llava/
+          gcloud storage cp \
+            gs://YOUR_GCS_BUCKET/datasets/llava_data/train2017.zip \
+            /data/llava/
+          echo "=== [$(date)] Unzipping train2017.zip ==="
+          python3 -c "import zipfile; zipfile.ZipFile('/data/llava/train2017.zip').extractall('/data/llava/')"
+          echo "=== [$(date)] Dataset ready ==="
+
+          # 4. 训练（激活 venv）
+          source /opt/venv311/bin/activate
+          cd /workspace
+          MODEL_PATH=Qwen/Qwen3-VL-8B-Instruct \
+          DATASETS=llava_instruct_150k \
+          LLAVA_DATA_ROOT=/data/llava \
+          BATCH_SIZE=2 \
+          FSDP_DEVICES=4 \
+          MAX_STEPS=30 \
+          MAX_PIXELS=50176 \
+          GCS_OUTPUT_DIR=gs://YOUR_GCS_BUCKET_ASIA/qwen3vl-8b-test \
+          REPORT_TO=tensorboard \
+          RUN_NAME=qwen3vl-8b-v6e16-bench \
+          SAVE_STEPS=1000 \
+          bash jax_qwenvl/scripts/train_tpu.sh
+
+        env:
+        - name: JOB_COMPLETION_INDEX
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: TF_CPP_MIN_LOG_LEVEL
+          value: "0"
+        resources:
+          requests:
+            cpu: 10
+            memory: 407Gi
+            google.com/tpu: 4
+          limits:
+            cpu: 10
+            memory: 407Gi
+            google.com/tpu: 4

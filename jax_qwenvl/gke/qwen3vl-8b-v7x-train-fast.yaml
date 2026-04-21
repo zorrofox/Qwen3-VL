@@ -1,0 +1,138 @@
+# Qwen3-VL 8B 训练 Job — GKE TPU v7x (Ironwood)，单 host 2x2x1（8 JAX devices）
+#
+# 与 qwen3vl-8b-v7x-train-job.yaml 的差异：
+#   1. topology 2x2x1（单 host），completions=1，无需 workload policy
+#   2. 数据从 lustre PVC 挂载（/data/qwen3vl/llava_data），跳过 GCS zip 下载/解压
+#   3. MODEL_MAX_LENGTH=1024 + BATCH_SIZE 通过 env 切换（2 / 4），对标 V7X_BENCHMARK 基线
+#   4. LIBTPU_INIT_ARGS：MaxText 推荐的 v7x XLA flags
+#   5. ENABLE_FP8=False（已知 Qwix pattern 错，等 batch=4 跑稳后再修）
+#
+# 集群：bodaborg-tpu7x-auto-nap2 (cloud-tpu-multipod-dev, us-central1-c)
+# Reservation：cloudtpu-20260317203000-769538580
+# 前置：lustre-stage-llava Job 已完成（数据在 /lustre/qwen3vl/llava_data/）
+#
+# 提交（Phase A：batch=2 基线）：
+#   tar czf /tmp/jax_qwenvl.tar.gz jax_qwenvl/ && \
+#   gcloud storage cp /tmp/jax_qwenvl.tar.gz gs://grhuang-02-vertex-ai/code/
+#   kubectl apply -f jax_qwenvl/gke/qwen3vl-8b-v7x-train-fast.yaml
+#   kubectl logs -f -n default job/qwen3vl-8b-v7x-train-fast
+#
+# Phase B（batch=4）：先 kubectl delete -f，改 BATCH_SIZE=4 + RUN_NAME，再 apply
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen3vl-8b-v7x-train-fast
+  namespace: default
+spec:
+  backoffLimit: 0
+  completions: 1            # 2x2x1 单 host
+  parallelism: 1
+  completionMode: NonIndexed
+  template:
+    metadata:
+      labels:
+        app: qwen3vl-v7x-fast
+    spec:
+      restartPolicy: Never
+      serviceAccountName: grhuang-trainer-ksa
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+        cloud.google.com/reservation-name: cloudtpu-20260317203000-769538580
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+      containers:
+      - name: trainer
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest
+        command:
+        - bash
+        - -c
+        - |
+          set -euo pipefail
+          echo "=== [$(date)] Pod starting on v7x (single host 2x2x1, 8 JAX dev) ==="
+
+          # 1. 下载代码
+          echo "=== [$(date)] downloading jax_qwenvl code ==="
+          mkdir -p /workspace && cd /workspace
+          gcloud storage cp gs://grhuang-02-vertex-ai/code/jax_qwenvl.tar.gz .
+          tar xzf jax_qwenvl.tar.gz
+
+          # 2. Python 3.11 + 依赖
+          echo "=== [$(date)] installing Python 3.11 + deps ==="
+          apt-get update -qq
+          apt-get install -y -qq python3.11 python3.11-venv python3.11-dev
+          python3.11 -m venv /opt/venv311
+          source /opt/venv311/bin/activate
+          pip install --quiet "jax[tpu]==0.9.0" \
+            -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+          pip install --quiet -r jax_qwenvl/requirements.txt \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+          echo "=== JAX: $(python3 -c 'import jax; print(jax.__version__, jax.devices())') ==="
+
+          # 3. 模型从 GCS 拉到本地
+          echo "=== [$(date)] downloading model from GCS ==="
+          mkdir -p /workspace/model
+          gcloud storage cp -r \
+            gs://grhuang-02-vertex-ai/models/Qwen3-VL-8B-Instruct/qwen3vl-8b \
+            /workspace/model/
+          echo "=== [$(date)] model ready: $(ls /workspace/model/qwen3vl-8b/*.safetensors | wc -l) shards ==="
+
+          # 4. 数据已在 lustre /data/qwen3vl/llava_data/（由 lustre-stage-llava Job 准备）
+          echo "=== [$(date)] dataset on lustre ==="
+          ls /data/qwen3vl/llava_data/ | head -5
+          echo "image count: $(find /data/qwen3vl/llava_data/train2017 -name '*.jpg' 2>/dev/null | wc -l)"
+
+          # 5. 训练
+          source /opt/venv311/bin/activate
+          cd /workspace
+          MODEL_PATH=/workspace/model/qwen3vl-8b \
+          DATASETS=llava_instruct_150k \
+          LLAVA_DATA_ROOT=/data/qwen3vl/llava_data \
+          BATCH_SIZE=${BATCH_SIZE:-2} \
+          FSDP_DEVICES=4 \
+          MAX_STEPS=30 \
+          MAX_PIXELS=50176 \
+          MODEL_MAX_LENGTH=1024 \
+          ENABLE_FP8=${ENABLE_FP8:-False} \
+          PRINT_MODULE_PATHS=${PRINT_MODULE_PATHS:-} \
+          GCS_OUTPUT_DIR=gs://grhuang-02-vertex-ai/qwen3vl-v7x-fast \
+          REPORT_TO=tensorboard \
+          RUN_NAME=${RUN_NAME:-qwen3vl-8b-v7x8-L1024-bs2-bench} \
+          SAVE_STEPS=9999 \
+          bash jax_qwenvl/scripts/train_tpu.sh
+
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: BATCH_SIZE
+          value: "8"
+        - name: RUN_NAME
+          value: "qwen3vl-8b-v7x8-L1024-bs8-fp8-bench"
+        - name: ENABLE_FP8
+          value: "True"
+        - name: PRINT_MODULE_PATHS
+          value: ""   # dry-run 已完成；module_path 命名: model/layers_*/self_attn/{q,k,v,o}_proj + mlp/{gate,up,down}_proj
+        - name: HF_HUB_ENABLE_HF_TRANSFER
+          value: "1"
+        - name: LIBTPU_INIT_ARGS
+          value: >-
+            --xla_enable_async_all_gather=true
+            --xla_enable_async_all_reduce=true
+            --xla_tpu_enable_sparse_core_collective_offload_all_gather=true
+            --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true
+            --xla_tpu_enable_sparse_core_collective_offload_all_reduce=true
+            --xla_tpu_scoped_vmem_limit_kib=98304
+        resources:
+          requests:
+            google.com/tpu: 4
+          limits:
+            google.com/tpu: 4
+        volumeMounts:
+        - name: lustre
+          mountPath: /data
+      volumes:
+      - name: lustre
+        persistentVolumeClaim:
+          claimName: lustre-volume

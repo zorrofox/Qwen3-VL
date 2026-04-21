@@ -1,0 +1,71 @@
+# TPU v7x 单 host 验证 Job（实测：8 JAX 设备 = 4 物理芯片 × 2 逻辑核）
+#
+# 关键发现（2026-04-10）：
+#   tpu7x-standard-4t 每节点 = 4 物理芯片 = 8 JAX logical devices
+#   xpk 命名"tpu7x-8" = 1 VM × 8 JAX devices（对应 1 node）
+#   xpk 命名"tpu7x-16"= 2 VMs × 8 JAX devices = 16 JAX devices（"16卡"）
+#
+# 用途：验证 v7x 单 host 可用（无需 workload policy）
+#
+# 前提：
+#   gcloud container clusters get-credentials YOUR_GKE_CLUSTER \
+#     --region=us-central1 --project=YOUR_GCP_PROJECT
+#   # 将当前机器 IP 加入授权网络（若从私有网络外访问）
+#
+# 提交：
+#   kubectl apply -f verify-tpu-v7x-8chips.yaml
+#   kubectl logs -l job-name=verify-tpu-v7x-single --follow
+#   kubectl delete -f verify-tpu-v7x-8chips.yaml
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: verify-v7x-single-svc
+spec:
+  clusterIP: None
+  selector:
+    job-name: verify-tpu-v7x-single
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: verify-tpu-v7x-single
+spec:
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  completionMode: Indexed
+  template:
+    spec:
+      subdomain: verify-v7x-single-svc
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x    # v7x 加速器标签
+        cloud.google.com/gke-tpu-topology: 2x2x1       # tpu7x-8: 单 host，无需 workload policy
+      containers:
+      - name: tpu-job
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest
+        command:
+        - bash
+        - -c
+        - |
+          set -euo pipefail
+          echo "=== JAX version ==="
+          python3 -c "import jax; print('JAX:', jax.__version__)"
+          echo "=== TPU device check (single host) ==="
+          python3 -c "
+          import jax
+          # 单 host 无需 jax.distributed.initialize()
+          total = jax.device_count()
+          local = jax.local_device_count()
+          print(f'local_devices={local}, total_devices={total}')
+          # v7x: 4 物理芯片 × 2 逻辑核 = 8 JAX devices per host
+          assert total == 8, f'Expected 8 JAX devices (tpu7x single host), got {total}'
+          print('PASS: 8 v7x JAX devices available on single host')
+          print(f'Devices: {jax.devices()}')
+          "
+        resources:
+          requests:
+            google.com/tpu: 4     # 4 物理芯片 = 1 整个 tpu7x-standard-4t 节点
+          limits:
+            google.com/tpu: 4

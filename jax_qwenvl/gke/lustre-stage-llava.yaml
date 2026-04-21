@@ -1,0 +1,81 @@
+# 一次性 Job：从 GCS 把 LLaVA 训练数据复制到 lustre PVC，并解压 train2017.zip。
+# 完成后训练 Pod 直接挂 lustre 读 /data/llava，跳过运行时下载。
+#
+# 提交：
+#   kubectl apply -f jax_qwenvl/gke/lustre-stage-llava.yaml
+#   kubectl logs -f -n default job/lustre-stage-llava
+#   kubectl delete job lustre-stage-llava -n default   # 完成后清理
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lustre-stage-llava
+  namespace: default
+spec:
+  backoffLimit: 1
+  completions: 1
+  parallelism: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: grhuang-trainer-ksa
+      nodeSelector:
+        cloud.google.com/gke-nodepool: cpu-np   # 走 c4 CPU 节点池，避开 TPU
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+      containers:
+      - name: stager
+        image: google/cloud-sdk:slim
+        resources:
+          requests:
+            cpu: "8"
+            memory: "32Gi"
+          limits:
+            cpu: "8"
+            memory: "32Gi"
+        volumeMounts:
+        - name: lustre
+          mountPath: /lustre
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -euo pipefail
+          DEST=/lustre/qwen3vl/llava_data
+          echo "=== [$(date)] target dir: $DEST ==="
+          mkdir -p "$DEST"
+
+          # 已存在则跳过（幂等）
+          if [ -f "$DEST/llava_instruct_150k.json" ] && [ -d "$DEST/train2017" ]; then
+            echo "=== already staged ==="
+            ls -lah "$DEST"
+            du -sh "$DEST/train2017" || true
+            exit 0
+          fi
+
+          echo "=== [$(date)] downloading json ==="
+          gcloud storage cp \
+            gs://grhuang-02-vertex-ai/datasets/llava_data/llava_instruct_150k.json \
+            "$DEST/"
+
+          echo "=== [$(date)] downloading train2017.zip (~19GB) ==="
+          gcloud storage cp \
+            gs://grhuang-02-vertex-ai/datasets/llava_data/train2017.zip \
+            "$DEST/"
+
+          echo "=== [$(date)] installing unzip ==="
+          apt-get update -qq && apt-get install -y -qq unzip
+
+          echo "=== [$(date)] unzipping (~118k images) ==="
+          cd "$DEST"
+          unzip -q -n train2017.zip
+          rm -f train2017.zip
+
+          echo "=== [$(date)] done ==="
+          ls -lah "$DEST"
+          echo "image count: $(find $DEST/train2017 -name '*.jpg' | wc -l)"
+          du -sh "$DEST"
+      volumes:
+      - name: lustre
+        persistentVolumeClaim:
+          claimName: lustre-volume
