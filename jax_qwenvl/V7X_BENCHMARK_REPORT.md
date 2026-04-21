@@ -1,339 +1,252 @@
-# TPU v7x 训练基准测试报告
+# TPU v7x — Qwen3-VL 8B 训练基准报告
 
-> 日期：2026-04-12  
-> 模型：Qwen3-VL-8B-Instruct  
-> 数据集：llava_instruct_150k（157,712 样本）  
-> 集群：GKE `YOUR_GKE_CLUSTER`，us-central1-c  
+> **模型**：Qwen3-VL-8B-Instruct（自定义 JAX/Flax 多模态训练栈）
+> **数据**：LLaVA-Instruct-150K (157,712 样本)
+> **首版**：2026-04-12 ｜ **最近更新**：2026-04-21
 
 ---
 
-## 1. TPU v7x 硬件规格
+## 1. 硬件与集群
+
+### 1.1 v7x (Ironwood) 规格
 
 | 参数 | 值 |
 |------|-----|
 | 机器类型 | `tpu7x-standard-4t` |
-| 物理芯片数/节点 | 4 |
-| TensorCore 数/芯片 | 2（独立 chiplet） |
-| JAX devices/节点 | 4 × 2 = **8** |
-| HBM/芯片 | 192 GiB |
-| HBM/JAX device | 192 / 2 = **96 GiB** |
-| HBM 带宽/芯片 | 7,380 GiBps |
-| Peak BF16 算力/芯片 | 2,307 TFLOPs |
-| VMEM/TensorCore | 64 MB |
+| 物理芯片数 / 节点 | 4 |
+| TensorCore / 芯片 | 2（独立 chiplet） |
+| **JAX devices / 节点** | **8**（4 chips × 2 cores） |
+| HBM / 物理芯片 | 192 GiB（2 个 JAX dev 共享） |
+| HBM 带宽 / 芯片 | 7,380 GiB/s |
+| BF16 峰值 / 芯片 | 2,307 TFLOP/s |
+| BF16 峰值 / JAX dev | **1,153 TFLOP/s** |
+| VMEM / TensorCore | 64 MB |
 
-**关键发现**：`tpu7x-standard-4t` 每节点有 8 个 JAX 逻辑设备（非 4 个），因为每个物理芯片包含 2 个独立 TensorCore，各自拥有独立的 96 GiB HBM。
+### 1.2 测试集群
 
-### 测试配置（tpu7x-16）
-
-```
-2 nodes × 4 chips × 2 TensorCore = 16 JAX devices
-topology: 2x2x2
-xpk 命名: tpu7x-16
-GKE nodeSelector: gke-tpu-accelerator=tpu7x, gke-tpu-topology=2x2x2
-```
-
-FSDP 配置：
-
-```
-FSDP_DEVICES=4 → dp=4, fsdp=4, hybrid 模式
-每 JAX device 本地 batch = 2
-全局 batch = 16 devices × 2 = 32
-```
+| 集群 | 区域 | 拓扑 | 总 dev | 用途 |
+|------|------|------|--------|------|
+| `YOUR_GKE_CLUSTER` | asia-northeast1 | 2x2x2 (2 host) | 16 | 历史 multi-host 基准 |
+| `bodaborg-tpu7x-auto-nap2` | us-central1-c | 2x2x1 (1 host) | 8 | 当前活跃基准（lustre PVC） |
 
 ---
 
-## 2. 训练性能测试结果
+## 2. 性能基准
 
-### 2.1 稳态 step time 对比
+### 2.1 完整对照表
 
-| 配置 | step_time | tokens/s（实际） | HBM 占用 | 状态 |
-|------|-----------|----------------|---------|------|
-| L=1024, batch=2, XLA | **0.49s** | **~20k** | 低 | ✅ 最优 |
-| L=8192, batch=2, XLA | 5.22s | ~1,900 | **95.8%** | ⚠️ HBM 紧张 |
-| L=8192, batch=2, Pallas shard_map | 29.6s | ~300 | 未测 | ❌ 已回退 |
+> tokens/s 为 metrics_logger 实算（基于 attention_mask sum，非 padding）；MFU = actual_FLOPs / peak。
 
-> 注：tokens/s 为实际 token 数（非 padding），由训练日志 metrics_logger 计算。
+| # | 平台 | quant | per_dev_bs | global_bs | L | step_time | tokens/s | HBM peak | MFU | loss(30步) | 备注 |
+|---|------|-------|-----------|-----------|---|-----------|----------|----------|-----|-----------|------|
+| 1 | **H200×8** PyTorch ZeRO-3 | bf16 | 2 (grad×4) | 64 | 8192 | 3.3s | ~159k pad | — | — | **0.875** (1233步) | cuDNN Flash Attn |
+| 2 | v7x-16 hybrid dp=4/fsdp=4 | bf16 | 2 | 32 | 1024 | 0.49s | ~20k | 低 | — | 1.83 | XLA attention |
+| 3 | v7x-16 hybrid dp=4/fsdp=4 | bf16 | 2 | 32 | 8192 | 5.22s | ~1.9k | 95.8% | — | 1.82 | XLA O(L²) |
+| 4 | v7x-16 hybrid dp=4/fsdp=4 | bf16 | 2 | 32 | 8192 | **3.31s** | ~2.9k | 93% | — | — | **Splash Attention** ✅ |
+| 5 | v6e-16 hybrid dp=4/fsdp=4 | bf16 | 2 | 32 | 1024 | 0.78s | ~12.4k | — | — | 1.82 | 参照 |
+| 6 | v7x-8 hybrid dp=2/fsdp=4 | bf16 | 2 | 16 | 1024 | 0.56s | ~8.5k | — | — | 2.537 | single-host A |
+| 7 | v7x-8 hybrid dp=2/fsdp=4 | bf16 | 4 | 32 | 1024 | 0.75s | ~12.5k | 67% | 25.6% | 2.525 | **BF16 sweet spot** |
+| 8 | v7x-8 hybrid dp=2/fsdp=4 | bf16 | 8 | 64 | 1024 | 1.45s | ~12.5k | 67% | 26.5% | 2.534 | compute bound |
+| 9 | v7x-8 hybrid dp=2/fsdp=4 | **fp8 e4m3fn** | 4 | 32 | 1024 | **0.71s** | **~13.3k** | **45.5%** | **27.0%** | 2.549 | **FP8 sweet spot** ✅ |
+| 10 | v7x-8 hybrid dp=2/fsdp=4 | fp8 e4m3fn | 8 | 64 | 1024 | 1.37s | ~13.5k | 66% | 28.0% | 2.572 | compute bound |
 
-### 2.2 HBM 监控数据
+> H200 用 PyTorch + DeepSpeed ZeRO-3，跑足 1233 步，loss 收敛到 0.875。其他 v7x/v6e 行均为 30 步基准，loss 仅作健康度参考，不可与 H200 直接比较。
+> 行 6-10 数据来自 `bodaborg-tpu7x-auto-nap2`，挂载 lustre PVC `/data/qwen3vl/llava_data/`，全部启用 MaxText 推荐 XLA flags（`scoped_vmem_limit_kib=98304` + `sparse_core_collective_offload`）。
 
-通过 Cloud Monitoring API（`kubernetes.io/node/accelerator/memory_used`）实测：
+### 2.2 关键 deltas
 
-```
-L=8192, batch=2, XLA：
-  每芯片 HBM_used  = 181.58 GiB
-  每芯片 HBM_total = 189.49 GiB（≈ 192 GiB，余量为 runtime 保留）
-  利用率           = 95.8%
-```
+**FP8 vs BF16（同 batch=4，single-host）**：
 
-L=8192 时 HBM 接近上限的原因：`jax.nn.dot_product_attention`（XLA 实现）在每层计算完整的 `(B, H, L, L)` 注意力矩阵，复杂度 O(L²)。
+| 维度 | BF16 | FP8 | Δ |
+|------|------|-----|---|
+| step_time | 0.75s | 0.71s | -5.3% |
+| tokens/s | 12.5k | 13.3k | **+6.4%** |
+| HBM peak | 128 GiB (67%) | 87 GiB (45.5%) | **-32%** |
+| MFU | 25.6% | 27.0% | +1.4pp |
+| loss(30步) | 2.525 | 2.549 | +0.024（收敛健康） |
 
-### 2.3 XLA 编译时间
+> **HBM -32% 是 FP8 真生效的硬证据**——这部分压缩不可能由其他因素解释。但 step_time 增益小，因为量化只覆盖 LLM Dense（68% kernel），剩下 32% 的 vision tower 仍是 BF16 + 主要瓶颈。
 
-| 配置 | 编译步数 | 每步编译时间 | 稳态 step_time |
-|------|----------|-------------|---------------|
-| L=1024 (tpu7x-16) | 2步 | ~96s/步 | 0.49s |
-| L=8192 (tpu7x-16) | 2步 | ~148s/步 | 5.22s |
+**Splash Attention vs XLA（同 v7x-16, L=8192, batch=2）**：
 
-编译步数为 2（而非 1）是因为 FSDP 的前向和反向分别编译。
+| 维度 | XLA `dot_product_attention` | Splash via `shard_map(vmap)` | Δ |
+|------|----------------------------|------------------------------|---|
+| step_time | 5.22s | 3.31s | -37% |
+| tokens/s | ~1,900 | ~2,900 | +53% |
+| HBM | 95.8% | 93.0% | -2.8pp |
 
----
+> Splash 在 L≥4K 才有显著收益；L=1024 时 `block_q=min(512, L)` 退化为 2 个 block，行为接近 XLA（这就是 v7x-8 行 7 仍叫"BF16"而非"Splash"的原因）。
 
-## 3. 与 H200 ×8 的横向对比
+### 2.3 Compute bound 现象
 
-### 3.1 测试配置
+batch=4 → batch=8 (BF16 同样规律 FP8)：
+- step_time 1.93×（0.75→1.45 / 0.71→1.37），几乎线性
+- tokens/s 几乎持平（~12.5k / ~13.5k）
+- HBM 还有余量（FP8 bs4 仅 45.5%）
+- 含义：v7x TC 在当前实现下已"无空隙"被打满，加 batch 只是等比例延长时间，throughput 边际为 0
 
-| 参数 | H200 ×8 | v7x-16 (L=1024) | v7x-16 (L=8192) |
-|------|---------|----------------|----------------|
-| 框架 | PyTorch + DeepSpeed ZeRO-3 | JAX + Flax Hybrid FSDP | JAX + Flax Hybrid FSDP |
-| 序列长度 | 8,192 | 1,024 | 8,192 |
-| per-device batch | 2 | 2 | 2 |
-| 梯度累积 | 4 | 1 | 1 |
-| 有效 batch（全局 token 数/步） | 64 × 8192 = **524k tokens** | 32 × 1024 = **33k tokens** | 32 × 8192 = **262k tokens** |
+### 2.4 v7x 算力利用率（MFU）天花板
 
-### 3.2 性能指标
+| 实现栈 | TFLOP/s/dev | MFU | 备注 |
+|--------|-------------|-----|------|
+| H200 PyTorch ZeRO-3 | ~480 (peak 989) | ~48% | cuDNN FA + Apex 融合 |
+| MaxText text-only SFT (v7x) | ~232 | ~20% | Google 官方栈 |
+| 本仓库 BF16 bs4 (v7x-8) | 295 | **25.6%** | 自定义 + Splash |
+| 本仓库 FP8 bs4 (v7x-8) | 312 | **27.0%** | + Qwix QT |
 
-| 指标 | H200 ×8 | v7x (L=1024) | v7x (L=8192) |
-|------|---------|-------------|-------------|
-| step_time | 3.3s | 0.49s | 5.22s |
-| 有效 tokens/s（padded） | **~159k** | ~67k | ~50k |
-| samples/s | 19.4 | 65.3 | 6.1 |
-| vs H200（tokens/s） | 1× | 0.42× ❌ | 0.31× ❌ |
-| 最终 loss（步后） | **0.875**（1233步） | —（仅30步基准）| —（仅30步基准）|
+**为何 25-27% 而非 100%**（按影响排序）：
+1. **Vision tower 调度开销**：27 层 ViT × hidden=1152，大量小 matmul + LayerNorm，kernel launch 摊不开
+2. **LLM Splash 在 L=1024 退化**：block_q=512 时只切 2 个 block，与 XLA 等价
+3. **FFN 没接 Pallas 融合 kernel**：SwiGLU = 3 matmul + activation + element-wise，分开走 XLA 多 4 次 HBM 读写
+4. **GQA 用 `jnp.repeat`**：K/V 8→32 heads，多 75% HBM 流量
+5. **小全局 batch (32-64)**：collective reduction 摊销不充分
+6. **FP8 只覆盖 LLM Dense**：vision tower / lm_head 仍 BF16，约束整体上限
 
-### 3.3 对比结论
+### 2.5 HBM 监控方法
 
-**以有效 token 吞吐量（真实训练效率指标）衡量**：
-
-- v7x 在 L=1024 时样本吞吐最高（65 samples/s vs H200 的 19），但每步只处理 33k tokens，而 H200 每步处理 524k tokens。
-- **实际训练 token 效率**：H200 是 v7x L=1024 的 2.4×，是 v7x L=8192 的 3.2×。
-- 根本差距：H200 使用 cuDNN Flash Attention（O(L) 内存），可以高效跑 L=8192 大 batch；v7x 当前 XLA attention 是 O(L²)，无法在 L=8192 上扩大 batch。
-
----
-
-## 4. Flash Attention 研究历程
-
-### 4.1 尝试一：`jax.nn.dot_product_attention`（无效）
-
-**做法**：将原始手动 matmul+softmax 替换为 `jax.nn.dot_product_attention`。
-
-**结果**：
-- HBM：无变化（仍 95.8%）
-- step_time：5.22s → 4.99s（仅快 4%）
-
-**原因**：`jax.nn.dot_product_attention` 在 TPU 上默认走 XLA 实现（`implementation=None`），与手动计算等价，仍是 O(L²) 内存。JAX 0.9.0 中没有 TPU 的 `implementation='flash'` 或 `implementation='pallas'` 选项。
-
----
-
-### 4.2 尝试二：Pallas `flash_attention` + `shard_map`（更慢）
-
-**做法**：
-```python
-from jax.experimental.pallas.ops.tpu import flash_attention as tpu_fa
-from jax import shard_map
-
-def _pallas_attn(q, k, v, ab):
-    k = jnp.repeat(k, num_kv_groups, axis=1)  # GQA 展开
-    ab_full = jnp.broadcast_to(ab, (B_l, H_q, L, L))
-    return tpu_fa.flash_attention(q, k, v, ab=ab_full, sm_scale=scaling)
-
-attn_output = shard_map(
-    _pallas_attn, mesh=global_mesh,
-    in_specs=(...), out_specs=..., check_vma=False
-)(q, k, v, ab)
+```bash
+NODE=$(kubectl get pod -n default -l app=qwen3vl-v7x-fast -o jsonpath='{.items[0].spec.nodeName}')
+NOW=$(date -u +%s); START=$((NOW - 600))
+curl -sS -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  "https://monitoring.googleapis.com/v3/projects/cloud-tpu-multipod-dev/timeSeries?filter=metric.type%3D%22kubernetes.io%2Fnode%2Faccelerator%2Fmemory_used%22%20AND%20resource.labels.node_name%3D%22${NODE}%22&interval.startTime=$(date -u -d @$START +%Y-%m-%dT%H:%M:%SZ)&interval.endTime=$(date -u -d @$NOW +%Y-%m-%dT%H:%M:%SZ)&aggregation.alignmentPeriod=60s&aggregation.perSeriesAligner=ALIGN_MEAN"
 ```
 
-**结果（L=8192）**：
-- step_time：**29.6s**（XLA 5.22s 的 **6× 慢**）
-- tokens/s：~300（降至 XLA 的 1/6）
-
-**已经修复的 API 问题**（在调试过程中发现）：
-
-| 问题 | 错误现象 | 修复 |
-|------|---------|------|
-| CPU 单元测试未覆盖 dtype 差异 | `value dtype should be float32, but got bfloat16` | RoPE 后 q/k 为 float32，v 为 bfloat16，统一 cast |
-| Pallas bias 不接受广播形状 | `Attention bias shape mismatch` | `jnp.broadcast_to(ab, (B, H, L, L))` |
-| `shard_map` 不接受 `check_rep` | `got unexpected keyword argument 'check_rep'` | 改为 `check_vma=False` |
-| `jax.experimental.shard_map` 已弃用 | DeprecationWarning | 改为 `jax.shard_map` |
-| Pallas 不支持 GQA | `Head count mismatch: 32, 8, 8` | shard_map 内部做 `jnp.repeat` |
-
-**6× 慢的根本原因**：
-1. shard_map 内部 `jnp.repeat` 每步展开 K/V（8→32 heads），4× 数据量
-2. Pallas `flash_attention` kernel 非最优（应用 `splash_attention`）
-3. shard_map dispatch 开销在 JAX 0.9.0 较高
-4. block_size 默认 128 对 Ironwood 64MB VMEM 来说过小
+返回 4 路 series（4 物理芯片，每芯片 192 GiB）。每 JAX dev 看到 96 GiB 上限。
 
 ---
 
-### 4.3 研究结论：正确的方向（未实现）
+## 3. 实现现状
 
-#### 应使用 `splash_attention`，不是 `flash_attention`
+### 3.1 LLM TextAttention — Splash Attention（已上线）
 
-| | `flash_attention` | `splash_attention`（推荐） |
-|--|-----------------|-------------------------|
-| 优化程度 | 早期版本 | 专为 Ironwood 优化 |
-| DMA pipelining | 否 | 是 |
-| VMEM 利用 | 低 | 高（64MB 充分利用）|
-| L<4K | 无优势 | 无优势（XLA 已够）|
-| L>4K | 有优势 | **更大优势** |
-
-#### MaxText 的正确实现模式
+**文件**：`jax_qwenvl/model/llm.py:113-198`
 
 ```python
-# MaxText 在 Ironwood 上的正式做法：vmap 必须在 shard_map 内部
-from jax.experimental.pallas.ops.tpu.splash_attention import (
-    splash_attention_kernel, make_splash_mha, SegmentIds, BlockSizes
-)
-
-# 构造 splash kernel（只做一次）
-kernel = make_splash_mha(
-    block_sizes=BlockSizes(
-        block_q=512,         # 推荐：Ironwood 大 VMEM 适合大 block
-        block_kv_compute=512,
-        block_kv=512,
+if global_mesh is not None and jax.default_backend() == "tpu":
+    # Splash Attention via shard_map(vmap(splash_kernel)) — MaxText 模式
+    causal_mask = _sam.CausalMask(shape=(L, L))
+    multi_head_mask = _sam.MultiHeadMask(masks=(causal_mask,) * num_heads)
+    splash_kernel = _sak.make_splash_mha(
+        mask=multi_head_mask,
+        block_sizes=_sak.BlockSizes(
+            block_q=min(512, L), block_kv=min(512, L), block_kv_compute=min(512, L),
+            block_q_dkv=min(512, L), block_kv_dkv=min(512, L), block_kv_dkv_compute=min(512, L),
+            block_q_dq=min(512, L), block_kv_dq=min(512, L),
+        ),
     )
-)
-
-@functools.partial(
-    shard_map, mesh=mesh,
-    in_specs=(batch_spec, batch_spec, batch_spec, seg_spec),
-    out_specs=batch_spec,
-    check_rep=False,
-)
-def wrapped(q, k, v, seg_ids):
-    # vmap 在 shard_map 内部处理 batch 维度
-    return jax.vmap(kernel)(q, k, v, segment_ids=seg_ids)
+    def _splash_fn(q_l, k_l, v_l):
+        if num_kv_groups > 1:                      # GQA: Splash 不原生支持
+            k_l = jnp.repeat(k_l, num_kv_groups, axis=1)
+            v_l = jnp.repeat(v_l, num_kv_groups, axis=1)
+        return jax.vmap(splash_kernel)(q_l, k_l, v_l)
+    attn_output = shard_map(_splash_fn, mesh=global_mesh,
+                            in_specs=(batch_spec,)*3, out_specs=batch_spec, check_vma=False)(q, k, v)
+else:
+    # CPU/GPU 回退：jax.nn.dot_product_attention（XLA O(L²)）
 ```
 
-**注意**：`splash_attention` 用 `segment_ids` 处理 packed sequences（替代我们的 block-diagonal additive mask），需要修改数据管道。
+| 长度 | 行为 | 收益 |
+|------|------|------|
+| L=1024 | block_q=512，仅 2 block，退化为类 XLA | 几乎 0 |
+| L=4096 | 8 block，开始有 O(L) 优势 | 中等 |
+| L=8192 | 16 block，充分 pipeline | **+53% tok/s**（行 3 vs 4） |
 
-#### 现有库调研（2026 年 4 月）
+### 3.2 Vision ViT Attention — XLA（待优化）
 
-| 库 | TPU 支持 | SPMD 自动 | 结论 |
-|----|---------|-----------|----|
-| `flash-attn-jax 0.6.2` | ❌ CUDA 专用 | — | 无用 |
-| `kvax`（Nebius） | ❌ GPU/Triton | — | 无用 |
-| `jax-flash-attn2` | ✅ Pallas 后端 | ❌ 需 shard_map | 可参考 |
-| JAX 内置 `splash_attention` | ✅ Ironwood 优化 | ❌ 需 shard_map | **推荐路径** |
+**文件**：`jax_qwenvl/model/vit.py:200-230`
 
-JAX 0.9.2（2026-03-18 发布）未新增 TPU Flash Attention 自动支持，shard_map 仍是必须的。
+```python
+attn_bias = block_diagonal_mask(cu_seqlens, ...)
+attn_output = jax.nn.dot_product_attention(q, k, v, bias=attn_bias, scale=scaling)
+```
+
+未接 Splash 的原因：vision token 数随 batch 与图片数动态变化，需要 `segment_ids` 改造数据管道。
+
+### 3.3 Quantization — Qwix QT FP8（已上线）
+
+**文件**：`jax_qwenvl/train/train.py:344-372`
+
+```python
+if training_args.enable_fp8:
+    rules = [
+        qwix.QuantizationRule(
+            module_path=r'.*(q_proj|k_proj|v_proj|o_proj)$',
+            weight_qtype=jnp.float8_e4m3fn, act_qtype=jnp.float8_e4m3fn,
+        ),
+        qwix.QuantizationRule(
+            module_path=r'.*(gate_proj|up_proj|down_proj)$',
+            weight_qtype=jnp.float8_e4m3fn, act_qtype=jnp.float8_e4m3fn,
+        ),
+    ]
+    model = qwix.quantize_model(model, qwix.QtProvider(rules))
+```
+
+| 项 | 值 |
+|----|-----|
+| API | `qwix.quantize_model(model, qwix.QtProvider(rules))` |
+| 模式 | QT（forward 时 cast，weights 保持 BF16 便于梯度更新） |
+| 覆盖 | 36 层 LLM × 7 Dense kernel = **252 / 370**（68%） |
+| 不量化 | visual ViT 27 层、deepstack mergers、patch_embed、lm_head |
+| dtype | **必须** `jnp.float8_e4m3fn`（dtype 对象），不能用字符串 `'fp8'` |
+| 验证 | `PRINT_MODULE_PATHS=1` dry-run 拿真实 path + `jax.make_jaxpr` 扫 forward 图 |
+
+### 3.4 Parallelism — Hybrid FSDP
+
+| 集群 | mesh | 备注 |
+|------|------|------|
+| Single host (8 dev) | `dp=2, fsdp=4` | 当前 v7x-8 |
+| Multi host v7x-16 (2 host) | `dp=4, fsdp=4` | 跨 host FSDP 受 ICI 带宽限制；checkpoint 用 `FSDP_DEVICES=4` 避开 Orbax 2-process allgather bug |
 
 ---
 
-## 5. 测试基础设施
+## 4. 失败记录
 
-### 5.1 GKE 相关配置（v7x 专项）
+### 4.1 Pallas `flash_attention` + shard_map（弃用）
 
-详见 `jax_qwenvl/gke/` 目录：
+**结果**：L=8192 step_time 29.6s（XLA 5.22s 的 6× 慢）。已经过 5 轮 API 修复仍跑不出收益，最终改用 `splash_attention`（§ 3.1）。
 
-| 文件 | 用途 |
-|------|------|
-| `smoke-test-v7x.yaml` | 提交训练前必须通过的 smoke test |
-| `qwen3vl-8b-v7x-train-job.yaml` | 正式训练 Job（L=8192，batch=2）|
-| `verify-tpu-v7x-8chips.yaml` | 单 host 设备验证（8 JAX devices）|
+| 修复过的 API 问题 | 错误 | 修复 |
+|------------------|------|------|
+| RoPE 后 dtype 不一致 | `value dtype should be float32, but got bfloat16` | q/k/v 统一 cast 到 hidden_states.dtype |
+| Pallas bias 不接受广播 | `Attention bias shape mismatch` | `jnp.broadcast_to(ab, (B, H, L, L))` |
+| `shard_map` 参数名变更 | `unexpected keyword 'check_rep'` | 改为 `check_vma=False` |
+| `jax.experimental.shard_map` 已弃用 | DeprecationWarning | 改为 `jax.shard_map` |
+| Pallas 不支持 GQA | `Head count mismatch: 32, 8, 8` | shard_map 内 `jnp.repeat` |
 
-**提交规范**：
+**6× 慢的根本原因**：shard_map dispatch 开销 + block_size=128 过小 + Pallas FA kernel 非最优。换 `splash_attention` 后这些问题都消失。
+
+### 4.2 Qwix FP8 第一次尝试 — `f30026f`（silent fail，已修复）
+
+| 错误 | 后果 | 修复 |
+|------|------|------|
+| `module_path=r'.*Dense.*'` 匹配 Flax 类名 | Qwix 实际匹配 instance name (`q_proj`/`Dense_0`)，0 layer 命中 | `r'.*(q_proj\|k_proj\|v_proj\|o_proj)$'` 等真实命名 |
+| `weight_qtype='fp8'` 字符串 | Qwix 0.1.6+ 要求 dtype 对象 | `jnp.float8_e4m3fn` |
+| 无任何验证 | log 写"FP8 enabled"但实际 BF16 跑 | 加 `PRINT_MODULE_PATHS=1` dry-run + `jax.make_jaxpr` 扫 forward |
+
+### 4.3 GQA via MQA + 双 vmap（无收益已 revert）
+
+尝试用 MQA 单 KV head + 在 KV groups 上额外 vmap，避免 `jnp.repeat`。实测 HBM/step_time 与 jnp.repeat 完全相同——K/V 展开占总 HBM 仅 0.05%，FFN intermediate 才是大头。
+
+---
+
+## 5. GKE 部署踩坑
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| nodeSelector 注入错误（调度失败） | `optimize-utilization-scheduler` 把 cpu/memory request 映射到 `cpu-np` 节点池 | pod spec 中**不要**请求 cpu/memory，只 `google.com/tpu: 4` |
+| multi-host 调度失败 | v7x 多 host 必须用 `HIGH_THROUGHPUT` workload policy | `gcloud beta compute resource-policies create workload-policy NAME --type=HIGH_THROUGHPUT --accelerator-topology=2x2x2` |
+| GCS 403 | 节点 SA 项目号不对 | 授权 `YOUR_COMPUTE_SA@developer.gserviceaccount.com` 到 bucket |
+| HuggingFace 下载挂起 | Xet CDN 在 v7x pod 网络不可达 | 预下到 GCS 或 lustre PVC |
+| Checkpoint allgather 死锁 | `FSDP_DEVICES=8` 下 Orbax 2-process bug | 用 `FSDP_DEVICES=4`（与 v6e 同 mesh） |
+| 数据集 zip 启动慢（5-10 min） | 每次训练 Job 重新 unzip 118k 张图 | 一次性 `lustre-stage-llava.yaml` 把数据放到 lustre PVC，训练 Job 直挂 |
+| `jax.make_jaxpr` 验证 FP8 失败 | dummy batch=1 无法 shard_map | 验证降级为 warning，靠 step_time + HBM 后置确认 |
+
+---
+
+## 6. 复现命令
+
 ```bash
-# 1. CPU 单元测试
-JAX_PLATFORM_NAME=cpu python3 -m pytest jax_qwenvl/tests/test_flash_attention.py -v
-
-# 2. TPU Smoke Test（必须 PASSED 才能提交训练）
-kubectl apply -f jax_qwenvl/gke/smoke-test-v7x.yaml
-kubectl wait --for=condition=complete job/v7x-smoke-test --timeout=600s
-
-# 3. 训练 Job
-kubectl apply -f jax_qwenvl/gke/qwen3vl-8b-v7x-train-job.yaml
-```
-
-### 5.2 GKE 踩坑记录
-
-| 问题 | 原因 | 解决方案 |
-|------|------|---------|
-| 调度失败（nodeSelector 注入错误） | `optimize-utilization-scheduler` 把 cpu/memory 请求映射到 `cpu-np` 节点池 | pod spec 中**不要**请求 cpu/memory，只请求 `google.com/tpu: 4` |
-| multi-host 需要 workload policy | v7x Ironwood 要求 `HIGH_THROUGHPUT` workload policy | `gcloud beta compute resource-policies create workload-policy NAME --type=HIGH_THROUGHPUT --accelerator-topology=2x2x2` |
-| GCS 403 | 节点 SA 项目号混用（`WRONG_PROJECT_SA` vs `CORRECT_PROJECT_SA`） | 授权正确的 SA：`YOUR_COMPUTE_SA@developer.gserviceaccount.com` |
-| HuggingFace 下载挂起 | Xet CDN 在 v7x pod 网络环境不可访问 | 预先下载到 GCS：`gs://YOUR_GCS_BUCKET/models/Qwen3-VL-8B-Instruct/qwen3vl-8b/` |
-| Checkpoint 保存崩溃 | `FSDP_DEVICES=8` 下 Orbax 2-process allgather 有 bug | 使用 `FSDP_DEVICES=4`（dp=4, fsdp=4），与 v6e 相同 mesh 结构 |
-
----
-
-## 6. 当前状态与后续建议
-
-### 6.1 当前代码状态
-
-```
-jax_qwenvl/model/llm.py TextAttention:
-  使用 jax.nn.dot_product_attention（XLA，SPMD 兼容，O(L²)）
-  + GQA 展开（jnp.repeat）
-  + dtype 统一 cast（处理 RoPE upcast）
-```
-
-已通过的测试（`jax_qwenvl/tests/`）：
-- 8 个 CPU 单元测试（test_flash_attention.py）
-- TPU Smoke Test（使用真实 mesh + jit + grad）
-
-### 6.2 实现 Splash Attention 的前提条件
-
-1. **数据管道改造**：将 block-diagonal additive mask 改为 `segment_ids`（每 token 所属序列编号），适配 Splash Attention API
-2. **Block size 调参**：从默认 128 改为 512，充分利用 Ironwood 64MB VMEM
-3. **Smoke test 更新**：测试 `splash_attention + vmap inside shard_map` 路径
-4. **JAX 版本考虑**：升级到 JAX 0.9.2（最新，2026-03-18）
-
-### 6.3 是否继续追 Flash Attention
-
-| 场景 | 建议 |
-|------|------|
-| 训练长上下文（L>4K） | 必须实现 Splash Attention，否则无法与 H200 竞争 |
-| 训练短上下文（L≤1024） | 现状 XLA 已足够，v7x 在 samples/s 上有优势 |
-| 与 H200 有效 token 吞吐对比 | 需要 L=8192 + Flash Attention，否则差距 2.4-3× |
-
----
-
-## 7. 已验证性能基准汇总
-
-| 配置 | 硬件 | step_time | tokens/s（实际） | HBM 利用率 | loss |
-|------|------|-----------|----------------|-----------|------|
-| 8B Hybrid dp=4,fsdp=4 | GKE v7x-16 | **0.49s** | ~20k | 低 | 1.83（30步）|
-| 8B Hybrid dp=4,fsdp=4 | GKE v6e-16 | 0.78s | ~12.4k | — | 1.82（30步）|
-| 8B ZeRO-3, L=8192 | GKE H200×8 | 3.3s | —（padded ~159k）| — | **0.875**（1233步）|
-| 8B XLA, L=8192 | GKE v7x-16 | 5.22s | ~1.9k | **95.8%** | 1.82（30步）|
-| 8B Pallas shard_map, L=8192 | GKE v7x-16 | 29.6s | ~300 | — | 1.82（30步）|
-
-### 7.1 单 host 8 dev（lustre PVC + XLA flags）batch / FP8 矩阵
-
-集群：`bodaborg-tpu7x-auto-nap2`（cloud-tpu-multipod-dev, us-central1-c）  
-拓扑：`tpu7x` 2x2x1 单 host（8 JAX dev = 4 chips × 2 cores）  
-Mesh：dp=2, fsdp=4（hybrid）  
-数据：lustre PVC 直挂（`/data/qwen3vl/llava_data/`，无运行时 zip 解压）  
-模型：Qwen3-VL-8B-Instruct，bf16，L=1024，max_pixels=50176  
-XLA flags：MaxText 推荐 + sparse_core_collective_offload
-
-| Phase | quant | per_dev_batch | global_batch | step_time | tokens/s | samples/s | HBM peak/192GiB | avg_loss(30步) |
-|-------|-------|--------------|--------------|-----------|----------|-----------|----------------|---------------|
-| A | bf16 | 2 | 16 | 0.56s | ~8.5k | 28.6 | — | 2.537 |
-| B | bf16 | 4 | 32 | 0.75s | ~12.5k | 42.7 | 128 GiB（67%） | 2.525 |
-| C | bf16 | 8 | 64 | 1.45s | ~12.5k | 44.1 | 128 GiB（67%）* | 2.534 |
-| **D（sweet spot）** | **fp8 e4m3fn** | **4** | **32** | **0.71s** | **~13.3k** | **45.1** | **87 GiB（45.5%）** | **2.549** |
-| E | fp8 e4m3fn | 8 | 64 | 1.37s | ~13.5k | 46.7 | 126 GiB（66%） | 2.572 |
-
-> \* Cloud Monitoring `kubernetes.io/node/accelerator/memory_used`：4 物理芯片 mean 112 / max 128 GiB（每物理芯片 192 GiB，其中 2 JAX dev 共享）。
-
-**FP8 配置（Qwix QT, jax.numpy.float8_e4m3fn）**：
-- 量化范围：仅 LLM decoder 36 层的 attention `{q,k,v,o}_proj` + FFN `{gate,up,down}_proj`（共 252 个 kernel）
-- 不量化：visual ViT 27 层、deepstack mergers、patch_embed、lm_head（数值敏感 / 收益小）
-- 上次失败原因（`f30026f`）：`module_path=r'.*Dense.*'` 匹配 Flax 类名而非 instance name；`weight_qtype='fp8'` 字符串无效
-- 本次修对：`module_path=r'.*(q_proj|...|down_proj)$'` + `jnp.float8_e4m3fn` dtype 对象
-- 验证：`jax.make_jaxpr(model.apply)` 扫描 forward 图中 `float8` op 出现次数
-
-**结论**：
-- batch=2→4（bf16）：tokens/s 1.47×（8.5k→12.5k），step_time 1.34×（0.56→0.75）。**有效收益**。
-- batch=4→8（bf16）：step_time 1.93×（0.75→1.45），tokens/s **完全持平**（~12.5k）。**compute bound**。
-- **FP8 vs BF16（同 batch=4）**：step_time -5.3%（0.75→0.71），tokens/s +6.4%（12.5k→13.3k），**HBM peak -32%（128→87 GiB）**，loss +0.024（可接受）。FP8 在 v7x TC 上**真生效**（HBM 大幅下降是硬证据），但 step_time 增益小——因为量化只覆盖 LLM Dense（68% kernels），剩下 32% 的 vision tower 是 compute 主瓶颈。
-- **FP8+batch=8 没拿到额外收益**：step_time 1.37s（vs FP8+bs4 0.71s 的 1.93×），tokens/s ~13.5k 与 FP8+bs4 持平 → 同样 compute bound，HBM 余量被 batch 翻倍消化。
-- 真要再推 throughput 必须把 FP8 扩到 ViT，或者拼 16 dev 拓扑（host 内 FSDP 通信自由，加 host 数线性放大）。
-
-**复现命令**：
-```bash
-# 一次性：lustre 数据 staging
+# 一次性：把 LLaVA 数据从 GCS 拷到 lustre PVC（约 7 min, 18 GiB）
 kubectl apply -f jax_qwenvl/gke/lustre-stage-llava.yaml
 kubectl wait --for=condition=complete --timeout=900s job/lustre-stage-llava -n default
 
@@ -341,16 +254,39 @@ kubectl wait --for=condition=complete --timeout=900s job/lustre-stage-llava -n d
 kubectl apply -f jax_qwenvl/gke/qwen3vl-8b-v7x-train-fast.yaml
 kubectl logs -f -n default -l app=qwen3vl-v7x-fast
 
-# 修 Qwix pattern：先 PRINT_MODULE_PATHS=1 ENABLE_FP8=False 跑一次拿 path 命名，
-# 再据此写 train.py 里的 module_path 正则；启动前 jaxpr 扫描会验证 float8 op 是否存在
+# 修 / 调整 Qwix pattern 时的 dry-run（拿真实 module path）
+# 在 yaml 里设：PRINT_MODULE_PATHS=1, ENABLE_FP8=False，跑一次取 path 命名后退出
 ```
 
-下一步推 throughput 的剩余杠杆：(a) 拿 2 个 v7x 节点拼 2x2x2（16 dev，目标 FP8 下 ~25k tok/s）；(b) FP8 扩展到 visual ViT（`visual/blocks_*/{linear_fc1,linear_fc2,attn/qkv,attn/proj}` pattern），覆盖剩下 32% kernels；(c) 视觉 tower 的 attention 接 splash_attention（vision compute bound 的根源）。
+GKE manifest 清单（`jax_qwenvl/gke/`）：
+
+| 文件 | 用途 |
+|------|------|
+| `lustre-stage-llava.yaml` | 一次性数据 staging（GCS → lustre PVC） |
+| `qwen3vl-8b-v7x-train-fast.yaml` | 当前活跃训练 Job（v7x-8 single-host + lustre） |
+| `qwen3vl-8b-v7x-train-job.yaml` | 历史 v7x-16 multi-host 训练 Job |
+| `smoke-test-v7x.yaml` | TPU + 模型加载 smoke test |
+| `verify-tpu-v7x-{4,8}chips.yaml` | 单 host 设备验证 |
+| `verify-tpu-v6e-16.yaml` | v6e 对照参考 |
 
 ---
 
-*参考资料：*
-- *MaxText Flash Attention 实现：https://github.com/AI-Hypercomputer/maxtext/blob/main/MaxText/layers/attentions.py*
-- *JAX Splash Attention：https://github.com/jax-ml/jax/blob/main/jax/experimental/pallas/ops/tpu/splash_attention/*
-- *Google Ironwood 性能指南：https://docs.cloud.google.com/tpu/docs/ironwood-performance*
-- *JAX 0.9.2 Changelog：https://docs.jax.dev/en/latest/changelog.html*
+## 7. 下一步推 throughput 的剩余杠杆
+
+| 方向 | 预估 step_time/MFU 收益 | 工作量 |
+|------|----------------------|--------|
+| **多 host 拼 16 dev**（FP8 + dp=4/fsdp=4） | tok/s ~25k（线性 scale） | 中（需 cluster 释放节点 + workload policy） |
+| **FP8 扩到 vision ViT**（`visual/blocks_*/{linear_fc1,linear_fc2,attn/qkv,attn/proj}` 加规则） | step_time -10%~15%（覆盖剩 32% kernel） | 小（pattern + dry-run + 数值稳定性验证） |
+| **vision ViT attention 接 Splash**（segment_ids 改造数据管道） | 长 patches 时显著 | 大 |
+| **Pallas FFN 融合 kernel**（SwiGLU 一次 dispatch） | MFU +5-8 pp | 大 |
+| **Splash block size 调大**（L≥4K 时 block_q=1024） | 长 L 训练时显著 | 小 |
+
+---
+
+## 附：参考资料
+
+- MaxText attention 实现：https://github.com/AI-Hypercomputer/maxtext/blob/main/MaxText/layers/attentions.py
+- JAX Splash Attention：https://github.com/jax-ml/jax/blob/main/jax/experimental/pallas/ops/tpu/splash_attention/
+- Qwix 量化：https://github.com/google/qwix
+- Google Ironwood 性能指南：https://docs.cloud.google.com/tpu/docs/ironwood-performance
+- Splash Attention 详细实现报告：[`SPLASH_ATTENTION_REPORT.md`](./SPLASH_ATTENTION_REPORT.md)
