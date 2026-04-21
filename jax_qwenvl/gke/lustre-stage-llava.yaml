@@ -17,7 +17,7 @@ spec:
   template:
     spec:
       restartPolicy: Never
-      serviceAccountName: grhuang-trainer-ksa
+      serviceAccountName: YOUR_KSA
       nodeSelector:
         cloud.google.com/gke-nodepool: cpu-np   # 走 c4 CPU 节点池，避开 TPU
       tolerations:
@@ -55,12 +55,12 @@ spec:
 
           echo "=== [$(date)] downloading json ==="
           gcloud storage cp \
-            gs://grhuang-02-vertex-ai/datasets/llava_data/llava_instruct_150k.json \
+            gs://YOUR_GCS_BUCKET/datasets/llava_data/llava_instruct_150k.json \
             "$DEST/"
 
           echo "=== [$(date)] downloading train2017.zip (~19GB) ==="
           gcloud storage cp \
-            gs://grhuang-02-vertex-ai/datasets/llava_data/train2017.zip \
+            gs://YOUR_GCS_BUCKET/datasets/llava_data/train2017.zip \
             "$DEST/"
 
           echo "=== [$(date)] installing unzip ==="

@@ -27,7 +27,7 @@
 | 集群 | 区域 | 拓扑 | 总 dev | 用途 |
 |------|------|------|--------|------|
 | `YOUR_GKE_CLUSTER` | asia-northeast1 | 2x2x2 (2 host) | 16 | 历史 multi-host 基准 |
-| `bodaborg-tpu7x-auto-nap2` | us-central1-c | 2x2x1 (1 host) | 8 | 当前活跃基准（lustre PVC） |
+| `YOUR_GKE_CLUSTER` | us-central1-c | 2x2x1 (1 host) | 8 | 当前活跃基准（lustre PVC） |
 
 ---
 
@@ -51,7 +51,7 @@
 | 10 | v7x-8 hybrid dp=2/fsdp=4 | fp8 e4m3fn | 8 | 64 | 1024 | 1.37s | ~13.5k | 66% | 28.0% | 2.572 | compute bound |
 
 > H200 用 PyTorch + DeepSpeed ZeRO-3，跑足 1233 步，loss 收敛到 0.875。其他 v7x/v6e 行均为 30 步基准，loss 仅作健康度参考，不可与 H200 直接比较。
-> 行 6-10 数据来自 `bodaborg-tpu7x-auto-nap2`，挂载 lustre PVC `/data/qwen3vl/llava_data/`，全部启用 MaxText 推荐 XLA flags（`scoped_vmem_limit_kib=98304` + `sparse_core_collective_offload`）。
+> 行 6-10 数据来自 `YOUR_GKE_CLUSTER`，挂载 lustre PVC `/data/qwen3vl/llava_data/`，全部启用 MaxText 推荐 XLA flags（`scoped_vmem_limit_kib=98304` + `sparse_core_collective_offload`）。
 
 ### 2.2 关键 deltas
 
@@ -108,7 +108,7 @@ batch=4 → batch=8 (BF16 同样规律 FP8)：
 NODE=$(kubectl get pod -n default -l app=qwen3vl-v7x-fast -o jsonpath='{.items[0].spec.nodeName}')
 NOW=$(date -u +%s); START=$((NOW - 600))
 curl -sS -H "Authorization: Bearer $(gcloud auth print-access-token)" \
-  "https://monitoring.googleapis.com/v3/projects/cloud-tpu-multipod-dev/timeSeries?filter=metric.type%3D%22kubernetes.io%2Fnode%2Faccelerator%2Fmemory_used%22%20AND%20resource.labels.node_name%3D%22${NODE}%22&interval.startTime=$(date -u -d @$START +%Y-%m-%dT%H:%M:%SZ)&interval.endTime=$(date -u -d @$NOW +%Y-%m-%dT%H:%M:%SZ)&aggregation.alignmentPeriod=60s&aggregation.perSeriesAligner=ALIGN_MEAN"
+  "https://monitoring.googleapis.com/v3/projects/YOUR_GCP_PROJECT/timeSeries?filter=metric.type%3D%22kubernetes.io%2Fnode%2Faccelerator%2Fmemory_used%22%20AND%20resource.labels.node_name%3D%22${NODE}%22&interval.startTime=$(date -u -d @$START +%Y-%m-%dT%H:%M:%SZ)&interval.endTime=$(date -u -d @$NOW +%Y-%m-%dT%H:%M:%SZ)&aggregation.alignmentPeriod=60s&aggregation.perSeriesAligner=ALIGN_MEAN"
 ```
 
 返回 4 路 series（4 物理芯片，每芯片 192 GiB）。每 JAX dev 看到 96 GiB 上限。

@@ -7,13 +7,13 @@
 #   4. LIBTPU_INIT_ARGS：MaxText 推荐的 v7x XLA flags
 #   5. ENABLE_FP8=False（已知 Qwix pattern 错，等 batch=4 跑稳后再修）
 #
-# 集群：bodaborg-tpu7x-auto-nap2 (cloud-tpu-multipod-dev, us-central1-c)
-# Reservation：cloudtpu-20260317203000-769538580
+# 集群：YOUR_GKE_CLUSTER (YOUR_GCP_PROJECT, us-central1-c)
+# Reservation：YOUR_RESERVATION
 # 前置：lustre-stage-llava Job 已完成（数据在 /lustre/qwen3vl/llava_data/）
 #
 # 提交（Phase A：batch=2 基线）：
 #   tar czf /tmp/jax_qwenvl.tar.gz jax_qwenvl/ && \
-#   gcloud storage cp /tmp/jax_qwenvl.tar.gz gs://grhuang-02-vertex-ai/code/
+#   gcloud storage cp /tmp/jax_qwenvl.tar.gz gs://YOUR_GCS_BUCKET/code/
 #   kubectl apply -f jax_qwenvl/gke/qwen3vl-8b-v7x-train-fast.yaml
 #   kubectl logs -f -n default job/qwen3vl-8b-v7x-train-fast
 #
@@ -34,11 +34,11 @@ spec:
         app: qwen3vl-v7x-fast
     spec:
       restartPolicy: Never
-      serviceAccountName: grhuang-trainer-ksa
+      serviceAccountName: YOUR_KSA
       nodeSelector:
         cloud.google.com/gke-tpu-accelerator: tpu7x
         cloud.google.com/gke-tpu-topology: 2x2x1
-        cloud.google.com/reservation-name: cloudtpu-20260317203000-769538580
+        cloud.google.com/reservation-name: YOUR_RESERVATION
       tolerations:
       - key: "google.com/tpu"
         operator: "Exists"
@@ -56,7 +56,7 @@ spec:
           # 1. 下载代码
           echo "=== [$(date)] downloading jax_qwenvl code ==="
           mkdir -p /workspace && cd /workspace
-          gcloud storage cp gs://grhuang-02-vertex-ai/code/jax_qwenvl.tar.gz .
+          gcloud storage cp gs://YOUR_GCS_BUCKET/code/jax_qwenvl.tar.gz .
           tar xzf jax_qwenvl.tar.gz
 
           # 2. Python 3.11 + 依赖
@@ -75,7 +75,7 @@ spec:
           echo "=== [$(date)] downloading model from GCS ==="
           mkdir -p /workspace/model
           gcloud storage cp -r \
-            gs://grhuang-02-vertex-ai/models/Qwen3-VL-8B-Instruct/qwen3vl-8b \
+            gs://YOUR_GCS_BUCKET/models/Qwen3-VL-8B-Instruct/qwen3vl-8b \
             /workspace/model/
           echo "=== [$(date)] model ready: $(ls /workspace/model/qwen3vl-8b/*.safetensors | wc -l) shards ==="
 
@@ -97,7 +97,7 @@ spec:
           MODEL_MAX_LENGTH=1024 \
           ENABLE_FP8=${ENABLE_FP8:-False} \
           PRINT_MODULE_PATHS=${PRINT_MODULE_PATHS:-} \
-          GCS_OUTPUT_DIR=gs://grhuang-02-vertex-ai/qwen3vl-v7x-fast \
+          GCS_OUTPUT_DIR=gs://YOUR_GCS_BUCKET/qwen3vl-v7x-fast \
           REPORT_TO=tensorboard \
           RUN_NAME=${RUN_NAME:-qwen3vl-8b-v7x8-L1024-bs2-bench} \
           SAVE_STEPS=9999 \
