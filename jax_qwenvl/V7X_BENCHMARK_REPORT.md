@@ -51,10 +51,12 @@
 | 10 | v7x-8 hybrid dp=2/fsdp=4 | fp8 e4m3fn | 8 | 64 | 1024 | 1.37s | ~13.5k | 66% | 28.0% | 2.572 | compute bound |
 | 11 | v7x-8 hybrid dp=2/fsdp=4 | fp8 e4m3fn (LLM+ViT, pattern miss) | 4 | 32 | 1024 | 0.71s | ~13.3k | 86 GiB (45%) | 27.0% | 2.552 | ❌ pattern 未命中 ViT，等价行 9 |
 | 12 | v7x-8 hybrid dp=2/fsdp=4 | fp8 e4m3fn (LLM+ViT, real hit) | 4 | 32 | 1024 | 0.71s | ~13.3k | **185.6 GiB (97%)** | 27.0% | 2.552 | ❌ ViT 真量化反而炸 HBM |
+| 13 | **v7x-16 hybrid dp=4/fsdp=4** | fp8 e4m3fn (LLM-only) | 4 | **64** | 1024 | 1.07s | **~17.5k** | 86 GiB (45%) | 27.0% | 2.570 | ✅ **multi-host sweet spot** |
 
 > H200 用 PyTorch + DeepSpeed ZeRO-3，跑足 1233 步，loss 收敛到 0.875。其他 v7x/v6e 行均为 30 步基准，loss 仅作健康度参考，不可与 H200 直接比较。
-> 行 6-10 数据来自 `YOUR_GKE_CLUSTER`，挂载 lustre PVC `/data/qwen3vl/llava_data/`，全部启用 MaxText 推荐 XLA flags（`scoped_vmem_limit_kib=98304` + `sparse_core_collective_offload`）。
-> **行 11/12**：两次尝试把 Qwix FP8 扩到 ViT 都是负面 ROI。详见 § 4.4 / § 4.5。**当前默认配置仍是行 9**（LLM-only FP8）。
+> 行 6-10 数据来自 `YOUR_GKE_CLUSTER` single-host slice（lustre PVC + MaxText 推荐 XLA flags）。
+> **行 11/12**：两次尝试把 Qwix FP8 扩到 ViT 都是负面 ROI。详见 § 4.4 / § 4.5。
+> **行 13**：multi-host 2x2x2 + LLM-only FP8（基于 § 4.5 结论 ViT 不量化）。绑定 `bodaborg-tpu7x-nap-zonal-placement-policy` (HIGH_THROUGHPUT, 2x2x2)。yaml: `gke/qwen3vl-8b-v7x-train-fast-16dev.yaml`。
 
 ### 2.2 关键 deltas
 
@@ -69,6 +71,20 @@
 | loss(30步) | 2.525 | 2.549 | +0.024（收敛健康） |
 
 > **HBM -32% 是 FP8 真生效的硬证据**——这部分压缩不可能由其他因素解释。但 step_time 增益小，因为量化只覆盖 LLM Dense（68% kernel），剩下 32% 的 vision tower 仍是 BF16 + 主要瓶颈。
+
+**Multi-host (16 dev) vs Single-host (8 dev)，同 batch=4 per dev FP8**：
+
+| 维度 | 8 dev (single) | 16 dev (multi) | Δ |
+|------|---------------|----------------|---|
+| step_time | 0.71s | 1.07s | +51% |
+| global_batch | 32 | 64 | 2× |
+| tokens/s | 13.3k | **~17.5k** | **+32%** |
+| samples/s | 45.1 | 59.8 | +33% |
+| HBM peak (per node) | 87 GiB | 86 GiB | 持平 |
+| MFU | 27.0% | 27.0% | 持平 |
+| avg_loss(30) | 2.549 | 2.570 | +0.02（健康） |
+
+> Multi-host throughput +32%（不是 2×）：global batch 翻倍但 step_time 也涨 1.51×（跨 host ICI all-reduce overhead），net 提升 32%。MFU 不变 → 实现质量天花板没动，纯靠并行扩。要再推须从前述 § 2.4 的 6 项瓶颈着手。
 
 **Splash Attention vs XLA（同 v7x-16, L=8192, batch=2）**：
 
@@ -298,12 +314,17 @@ qwix.QuantizationRule(module_path=r'.*/(linear_fc1|linear_fc2)$', ...),  # ViT M
 kubectl apply -f jax_qwenvl/gke/lustre-stage-llava.yaml
 kubectl wait --for=condition=complete --timeout=900s job/lustre-stage-llava -n default
 
-# 训练（编辑 yaml 内 BATCH_SIZE / RUN_NAME / ENABLE_FP8）
+# Single-host (8 dev)：sweet spot tok/s 13.3k
 kubectl apply -f jax_qwenvl/gke/qwen3vl-8b-v7x-train-fast.yaml
 kubectl logs -f -n default -l app=qwen3vl-v7x-fast
 
+# Multi-host (16 dev) FP8：sweet spot tok/s 17.5k（autoscaler 起 2 节点 ~5min）
+kubectl apply -f jax_qwenvl/gke/qwen3vl-8b-v7x-train-fast-16dev.yaml
+kubectl logs -f -n default qwen3vl-8b-v7x-train-fast-16dev-0-<id>
+
 # 修 / 调整 Qwix pattern 时的 dry-run（拿真实 module path）
 # 在 yaml 里设：PRINT_MODULE_PATHS=1, ENABLE_FP8=False，跑一次取 path 命名后退出
+# 训练前 train.py:730-748 会自动 log "Qwix unused rules" 若有 rule 未命中
 ```
 
 GKE manifest 清单（`jax_qwenvl/gke/`）：
@@ -311,8 +332,9 @@ GKE manifest 清单（`jax_qwenvl/gke/`）：
 | 文件 | 用途 |
 |------|------|
 | `lustre-stage-llava.yaml` | 一次性数据 staging（GCS → lustre PVC） |
-| `qwen3vl-8b-v7x-train-fast.yaml` | 当前活跃训练 Job（v7x-8 single-host + lustre） |
-| `qwen3vl-8b-v7x-train-job.yaml` | 历史 v7x-16 multi-host 训练 Job |
+| `qwen3vl-8b-v7x-train-fast.yaml` | Single-host 8 dev 训练 Job（lustre + FP8） |
+| `qwen3vl-8b-v7x-train-fast-16dev.yaml` | **Multi-host 16 dev 训练 Job**（2x2x2 + FP8 + nap-zonal policy） |
+| `qwen3vl-8b-v7x-train-job.yaml` | 历史 v7x-16 multi-host 训练 Job（早期版本，无 FP8） |
 | `smoke-test-v7x.yaml` | TPU + 模型加载 smoke test |
 | `verify-tpu-v7x-{4,8}chips.yaml` | 单 host 设备验证 |
 | `verify-tpu-v6e-16.yaml` | v6e 对照参考 |
@@ -323,8 +345,9 @@ GKE manifest 清单（`jax_qwenvl/gke/`）：
 
 | 方向 | 预估 step_time/MFU 收益 | 工作量 |
 |------|----------------------|--------|
-| **多 host 拼 16 dev**（FP8 + dp=4/fsdp=4） | tok/s ~25k（线性 scale） | 中（需 cluster 释放节点 + workload policy） |
-| **FP8 扩到 vision ViT**（`visual/blocks_*/{linear_fc1,linear_fc2,attn/qkv,attn/proj}` 加规则） | step_time -10%~15%（覆盖剩 32% kernel） | 小（pattern + dry-run + 数值稳定性验证） |
+| ~~多 host 拼 16 dev~~ | ✅ **已完成（行 13）：tok/s 13.3k → 17.5k (+32%)** | — |
+| ~~FP8 扩到 vision ViT~~ | ❌ **已实测负面（§ 4.5）**：step_time 持平、HBM 翻倍 | — |
+| **更高拓扑 (4x4x4 = 64 dev)**（FP8 + dp/fsdp） | tok/s ~50-60k 估算（线性 scale，但跨多 host 通信摊销变差） | 中（cluster 已有 4x4x4 policy）|
 | **vision ViT attention 接 Splash**（segment_ids 改造数据管道） | 长 patches 时显著 | 大 |
 | **Pallas FFN 融合 kernel**（SwiGLU 一次 dispatch） | MFU +5-8 pp | 大 |
 | **Splash block size 调大**（L≥4K 时 block_q=1024） | 长 L 训练时显著 | 小 |

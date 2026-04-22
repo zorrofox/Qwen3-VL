@@ -1,0 +1,153 @@
+# Qwen3-VL 8B 训练 Job — GKE TPU v7x (Ironwood)，multi-host 2x2x2（16 JAX devices）
+#
+# 与 qwen3vl-8b-v7x-train-fast.yaml（single-host 8 dev）的差异：
+#   1. topology 2x2x2（2 host），completions=2/parallelism=2/Indexed
+#   2. 必须配 placement-policy（v7x multi-host 强制要求 HIGH_THROUGHPUT workload policy）
+#   3. 加 headless Service，subdomain=同名，让 GKE 自动注入 TPU_WORKER_HOSTNAMES
+#   4. FSDP_DEVICES=4 → dp=4/fsdp=4，与 v7x-16 历史基准（V7X_BENCHMARK row 2/4）同 mesh
+#      （已验证 FSDP_DEVICES=8 在多 host 下触发 Orbax 2-process allgather bug，详见 § 5）
+#   5. ENABLE_FP8=True，BATCH_SIZE=4，对照行 9 single-host FP8 sweet spot
+#
+# 集群：YOUR_GKE_CLUSTER (YOUR_GCP_PROJECT, us-central1-c)
+# Reservation：YOUR_RESERVATION
+# Workload Policy：YOUR_WORKLOAD_POLICY (cluster 自带，2x2x2)
+# 前置：lustre-stage-llava Job 已完成（数据在 lustre-volume:/qwen3vl/llava_data/）
+#
+# 提交：
+#   tar czf /tmp/jax_qwenvl.tar.gz jax_qwenvl/ && \
+#   gcloud storage cp /tmp/jax_qwenvl.tar.gz gs://YOUR_GCS_BUCKET/code/
+#   kubectl apply -f jax_qwenvl/gke/qwen3vl-8b-v7x-train-fast-16dev.yaml
+#   kubectl logs -f -n default -l app=qwen3vl-v7x-fast-16dev --all-containers --max-log-requests=2
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen3vl-v7x-16dev-headless
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    app: qwen3vl-v7x-fast-16dev
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen3vl-8b-v7x-train-fast-16dev
+  namespace: default
+spec:
+  backoffLimit: 0
+  completions: 2            # 2 host × 8 JAX dev = 16 JAX devices
+  parallelism: 2
+  completionMode: Indexed   # GKE TPU multi-host 必须用 Indexed（每 host 拿到固定 index）
+  template:
+    metadata:
+      labels:
+        app: qwen3vl-v7x-fast-16dev
+    spec:
+      restartPolicy: Never
+      serviceAccountName: YOUR_KSA
+      subdomain: qwen3vl-v7x-16dev-headless   # 必须等于 Service name，GKE 据此注入 TPU_WORKER_HOSTNAMES
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x2
+        cloud.google.com/reservation-name: YOUR_RESERVATION
+        cloud.google.com/placement-policy-name: YOUR_WORKLOAD_POLICY
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+      containers:
+      - name: trainer
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:latest
+        command:
+        - bash
+        - -c
+        - |
+          set -euo pipefail
+          echo "=== [$(date)] Pod ${JOB_COMPLETION_INDEX} starting on v7x (multi-host 2x2x2, 16 JAX dev) ==="
+
+          # 1. 下载代码
+          echo "=== [$(date)] downloading jax_qwenvl code ==="
+          mkdir -p /workspace && cd /workspace
+          gcloud storage cp gs://YOUR_GCS_BUCKET/code/jax_qwenvl.tar.gz .
+          tar xzf jax_qwenvl.tar.gz
+
+          # 2. Python 3.11 + 依赖
+          echo "=== [$(date)] installing Python 3.11 + deps ==="
+          apt-get update -qq
+          apt-get install -y -qq python3.11 python3.11-venv python3.11-dev
+          python3.11 -m venv /opt/venv311
+          source /opt/venv311/bin/activate
+          pip install --quiet "jax[tpu]==0.9.0" \
+            -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+          pip install --quiet -r jax_qwenvl/requirements.txt \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+          echo "=== JAX: $(python3 -c 'import jax; print(jax.__version__, jax.device_count(), jax.devices())') ==="
+
+          # 3. 模型从 GCS 拉到本地
+          echo "=== [$(date)] downloading model from GCS ==="
+          mkdir -p /workspace/model
+          gcloud storage cp -r \
+            gs://YOUR_GCS_BUCKET/models/Qwen3-VL-8B-Instruct/qwen3vl-8b \
+            /workspace/model/
+          echo "=== [$(date)] model ready: $(ls /workspace/model/qwen3vl-8b/*.safetensors | wc -l) shards ==="
+
+          # 4. 数据已在 lustre /data/qwen3vl/llava_data/
+          echo "=== [$(date)] dataset on lustre ==="
+          ls /data/qwen3vl/llava_data/ | head -5
+
+          # 5. 训练
+          source /opt/venv311/bin/activate
+          cd /workspace
+          MODEL_PATH=/workspace/model/qwen3vl-8b \
+          DATASETS=llava_instruct_150k \
+          LLAVA_DATA_ROOT=/data/qwen3vl/llava_data \
+          BATCH_SIZE=${BATCH_SIZE:-4} \
+          FSDP_DEVICES=4 \
+          MAX_STEPS=30 \
+          MAX_PIXELS=50176 \
+          MODEL_MAX_LENGTH=1024 \
+          ENABLE_FP8=${ENABLE_FP8:-True} \
+          PRINT_MODULE_PATHS=${PRINT_MODULE_PATHS:-} \
+          GCS_OUTPUT_DIR=gs://YOUR_GCS_BUCKET/qwen3vl-v7x-fast-16dev \
+          REPORT_TO=tensorboard \
+          RUN_NAME=${RUN_NAME:-qwen3vl-8b-v7x16-L1024-bs4-fp8-bench} \
+          SAVE_STEPS=9999 \
+          bash jax_qwenvl/scripts/train_tpu.sh
+
+        env:
+        - name: JOB_COMPLETION_INDEX
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: BATCH_SIZE
+          value: "4"
+        - name: RUN_NAME
+          value: "qwen3vl-8b-v7x16-L1024-bs4-fp8-bench"
+        - name: ENABLE_FP8
+          value: "True"
+        - name: PRINT_MODULE_PATHS
+          value: ""
+        - name: HF_HUB_ENABLE_HF_TRANSFER
+          value: "1"
+        - name: LIBTPU_INIT_ARGS
+          value: >-
+            --xla_enable_async_all_gather=true
+            --xla_enable_async_all_reduce=true
+            --xla_tpu_enable_sparse_core_collective_offload_all_gather=true
+            --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true
+            --xla_tpu_enable_sparse_core_collective_offload_all_reduce=true
+            --xla_tpu_scoped_vmem_limit_kib=98304
+        resources:
+          requests:
+            google.com/tpu: 4
+          limits:
+            google.com/tpu: 4
+        volumeMounts:
+        - name: lustre
+          mountPath: /data
+      volumes:
+      - name: lustre
+        persistentVolumeClaim:
+          claimName: lustre-volume
