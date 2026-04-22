@@ -49,11 +49,12 @@
 | 8 | v7x-8 hybrid dp=2/fsdp=4 | bf16 | 8 | 64 | 1024 | 1.45s | ~12.5k | 67% | 26.5% | 2.534 | compute bound |
 | 9 | v7x-8 hybrid dp=2/fsdp=4 | **fp8 e4m3fn** | 4 | 32 | 1024 | **0.71s** | **~13.3k** | **45.5%** | **27.0%** | 2.549 | **FP8 sweet spot** ✅ |
 | 10 | v7x-8 hybrid dp=2/fsdp=4 | fp8 e4m3fn | 8 | 64 | 1024 | 1.37s | ~13.5k | 66% | 28.0% | 2.572 | compute bound |
-| 11 | v7x-8 hybrid dp=2/fsdp=4 | fp8 e4m3fn (LLM+ViT pattern) | 4 | 32 | 1024 | 0.71s | ~13.3k | 86 GiB (45%) | 27.0% | 2.552 | ⚠️ ViT pattern 未命中 |
+| 11 | v7x-8 hybrid dp=2/fsdp=4 | fp8 e4m3fn (LLM+ViT, pattern miss) | 4 | 32 | 1024 | 0.71s | ~13.3k | 86 GiB (45%) | 27.0% | 2.552 | ❌ pattern 未命中 ViT，等价行 9 |
+| 12 | v7x-8 hybrid dp=2/fsdp=4 | fp8 e4m3fn (LLM+ViT, real hit) | 4 | 32 | 1024 | 0.71s | ~13.3k | **185.6 GiB (97%)** | 27.0% | 2.552 | ❌ ViT 真量化反而炸 HBM |
 
 > H200 用 PyTorch + DeepSpeed ZeRO-3，跑足 1233 步，loss 收敛到 0.875。其他 v7x/v6e 行均为 30 步基准，loss 仅作健康度参考，不可与 H200 直接比较。
 > 行 6-10 数据来自 `YOUR_GKE_CLUSTER`，挂载 lustre PVC `/data/qwen3vl/llava_data/`，全部启用 MaxText 推荐 XLA flags（`scoped_vmem_limit_kib=98304` + `sparse_core_collective_offload`）。
-> **行 11**：尝试把 Qwix 量化扩到 ViT (rules 加 `r'.*visual/blocks_\d+/attn/(qkv|proj)$'` 和 `r'.*visual/.*(linear_fc1|linear_fc2)$'`)，但所有 3 项指标（step_time / HBM peak / loss）与行 9 完全一致 → **pattern 未命中任何 ViT layer**。详见 § 4.4。
+> **行 11/12**：两次尝试把 Qwix FP8 扩到 ViT 都是负面 ROI。详见 § 4.4 / § 4.5。**当前默认配置仍是行 9**（LLM-only FP8）。
 
 ### 2.2 关键 deltas
 
@@ -229,31 +230,50 @@ if training_args.enable_fp8:
 
 尝试用 MQA 单 KV head + 在 KV groups 上额外 vmap，避免 `jnp.repeat`。实测 HBM/step_time 与 jnp.repeat 完全相同——K/V 展开占总 HBM 仅 0.05%，FFN intermediate 才是大头。
 
-### 4.4 Qwix 扩展到 ViT 的 pattern 失效（2026-04-22）
+### 4.4 Qwix 扩展到 ViT 第一次尝试 — pattern 不命中（2026-04-22）
 
 尝试在原 LLM rules 基础上追加两条 ViT 规则：
 
 ```python
-qwix.QuantizationRule(
-    module_path=r'.*visual/blocks_\d+/attn/(qkv|proj)$',
-    weight_qtype=jnp.float8_e4m3fn, act_qtype=jnp.float8_e4m3fn,
-),
-qwix.QuantizationRule(
-    module_path=r'.*visual/.*(linear_fc1|linear_fc2)$',
-    weight_qtype=jnp.float8_e4m3fn, act_qtype=jnp.float8_e4m3fn,
-),
+qwix.QuantizationRule(module_path=r'.*visual/blocks_\d+/attn/(qkv|proj)$', ...),
+qwix.QuantizationRule(module_path=r'.*visual/.*(linear_fc1|linear_fc2)$', ...),
 ```
 
-**结果**（行 11 vs 行 9）：step_time / HBM peak / loss 三项**完全一致**——pattern 没命中任何 ViT layer。
+**结果**（表 § 2.1 行 11 vs 行 9）：step_time / HBM / loss 三项**完全一致** → pattern 命中 0 个 layer。
 
-**根因**：Qwix 0.1.6+ 的 `module_path` 正则匹配的是 **Flax module 在父链中的 instance name 段**（单段，如 `qkv`/`proj`），不是带斜杠的完整 PyTree path。LLM 的 `r'.*(q_proj|...)$'` 之所以命中是因为 `q_proj` 本身就是 instance name 的最后一段；ViT 的 `qkv` / `proj` 也是 instance name，但前缀 `visual/blocks_\d+/attn/` 把整条 pattern 卡死了。
+**根因**：误判了 Flax 模型实际的顶层模块层级。Qwix `module_path` 用 `re.fullmatch` 匹配 `'/'.join(flax_util.get_current_module_path())`，确实是完整 path（不是单段 instance name），但 ViT 实际 path 没有 `visual/blocks_*/attn/` 这个连续片段，所以带前缀的 pattern 永远 match 不上。
 
-**修复方向**（下一轮）：
-1. 改用单段 pattern：`r'qkv$|^proj$|^linear_fc1$|^linear_fc2$'`（要避免和 LLM 的 `q_proj` 冲突——`r'^proj$'` 只匹配恰好叫 `proj` 的）
-2. 或者：用 **路径无关的 module 类型筛选** —— Qwix 还支持按 `op_name` 匹配（针对 jax.lax.dot_general），不依赖命名
-3. 验证：扩展现有 `PRINT_MODULE_PATHS=1` dry-run，对每个 kernel 用 candidate pattern 试匹配，dry-run 输出 "WOULD MATCH: <path>"
+**根本修复**：用 `qwix.QtProvider.get_unused_rules()` 强制诊断（在 train.py:715-731）。第一次 forward 完成后立即调用，若有 rule 未命中即 log warning。这是 Qwix 唯一可靠的 pattern 验证 API（`jax.make_jaxpr` scan 因为 dummy batch=1 不能 shard splash_attention 而失败）。
 
-`jax.make_jaxpr` 在 dummy batch=1 时无法 shard，scan 失败 fallback 到 warning（这是当前唯一的"自动验证"机制失效原因）。下次需要构造 batch≥`global_batch` 的 dummy 才能跑 jaxpr scan。
+### 4.5 Qwix 扩展到 ViT 第二次尝试 — 命中但 net 负面（2026-04-22）
+
+改用 path-tail 形式的 pattern：
+
+```python
+qwix.QuantizationRule(module_path=r'.*/attn/qkv$', ...),         # ViT QKV
+qwix.QuantizationRule(module_path=r'.*/attn/proj$', ...),        # ViT attn output
+qwix.QuantizationRule(module_path=r'.*/(linear_fc1|linear_fc2)$', ...),  # ViT MLP + mergers
+```
+
+**Qwix 诊断日志确认**：`Qwix: all 5 rules matched at least one module` —— pattern 命中。
+
+**结果**（行 12 vs 行 9）：
+
+| 维度 | LLM-only FP8 | LLM+ViT FP8 (生效) | Δ |
+|------|-------------|--------------------|---|
+| step_time | 0.71s | 0.71s | **0** |
+| tokens/s | 13.3k | 13.3k | **0** |
+| HBM mean | 51.5 GiB | 95.3 GiB | **+85%** |
+| HBM peak | 87 GiB | **185.6 GiB (97%)** | **+114%** ⚠️ |
+| avg_loss(30) | 2.549 | 2.552 | +0.003（数值健康） |
+
+**为何 net 负面**：
+1. **ViT matmul 太小，FP8 无算力收益**：ViT hidden=1152、head_dim=72，每层 matmul 维度比 LLM (4096) 小一个量级，v7x TC 的 FP8 vs BF16 在小矩阵上几乎无 throughput 差异
+2. **HBM 暴涨**：Qwix QT 模式下 weights 仍以 BF16 存储（forward 时才动态 cast），但 27 层 ViT 的 cast/dequantize 临时 buffer 累计起来非常可观；加上 backward 时还要再算一遍，峰值飙到 185 GiB（97%，临近 OOM 红线）
+3. 净效果：算力没升、HBM 翻倍——明确的负面 ROI
+
+**当前结论**：FP8 仅量化 LLM Dense（行 9），不扩到 ViT。ViT 留 BF16。
+`train.py:347-378` 已注释说明这一决定。
 
 ---
 

@@ -350,37 +350,36 @@ def main():
     #   3) 没有验证 dtype，log 写 "FP8 enabled" 但实际 BF16 跑
     if training_args.enable_fp8:
         import qwix  # noqa
+        # Qwix 0.1.6+ 用 re.fullmatch 匹配 '/'.join(flax_util.get_current_module_path())
+        # 即整条 Flax 模块层级 path（不含 'kernel' 后缀）。`.*` 前缀允许任意祖先。
+        #
+        # 量化范围：仅 LLM decoder 36 层 × 7 kernel = 252 个。
+        # 不量化 ViT：实测把 ViT 加进去后（rules `r'.*/attn/(qkv|proj)$'` +
+        # `r'.*/(linear_fc1|linear_fc2)$'`）throughput 完全无收益（step_time 0.71s 不变），
+        # 反而 HBM peak 从 87 GiB 飙到 185 GiB（97% of 192）—— Qwix QT 在 ViT 27 层小
+        # matmul 上的 FP8 cast/dequantize 临时 buffer 抵消甚至超过了 weight 量化收益。
+        # 详见 V7X_BENCHMARK_REPORT § 4.5。
         rules = [
-            # ── LLM decoder（36 层 × 7 kernel = 252）─────────────────────────
-            # Attention QKV/O 投影
             qwix.QuantizationRule(
                 module_path=r'.*(q_proj|k_proj|v_proj|o_proj)$',
                 weight_qtype=jnp.float8_e4m3fn,
                 act_qtype=jnp.float8_e4m3fn,
             ),
-            # FFN（SwiGLU: gate/up/down）
             qwix.QuantizationRule(
                 module_path=r'.*(gate_proj|up_proj|down_proj)$',
                 weight_qtype=jnp.float8_e4m3fn,
                 act_qtype=jnp.float8_e4m3fn,
             ),
-            # ── Vision tower（27 层 ViT × 4 kernel + mergers = 116）──────────
-            # ViT blocks attention（combined QKV + output proj）
-            qwix.QuantizationRule(
-                module_path=r'.*visual/blocks_\d+/attn/(qkv|proj)$',
-                weight_qtype=jnp.float8_e4m3fn,
-                act_qtype=jnp.float8_e4m3fn,
-            ),
-            # ViT blocks MLP + DeepStack mergers + final merger（共用 linear_fc1/fc2 命名）
-            qwix.QuantizationRule(
-                module_path=r'.*visual/.*(linear_fc1|linear_fc2)$',
-                weight_qtype=jnp.float8_e4m3fn,
-                act_qtype=jnp.float8_e4m3fn,
-            ),
-            # 不量化：visual/patch_embed/proj（3D conv，输入边界），lm_head（vocab 投影，softmax 前）
         ]
-        model = qwix.quantize_model(model, qwix.QtProvider(rules))
-        logger.info("Qwix QT wrappers attached (rules=%d, qtype=float8_e4m3fn, scope=LLM+ViT)", len(rules))
+        provider = qwix.QtProvider(rules)
+        model = qwix.quantize_model(model, provider)
+        # 保存 provider 引用，训练前用 get_unused_rules() 诊断（避免 silent fail）
+        _qwix_provider = provider
+        _qwix_diagnosed = [False]   # mutable flag: 第一次 forward 后才诊断（rule matching 发生在 trace 时）
+        logger.info("Qwix QT wrappers attached (rules=%d, qtype=float8_e4m3fn, scope=LLM-only)", len(rules))
+    else:
+        _qwix_provider = None
+        _qwix_diagnosed = [True]
 
     # 6. Load weights from HuggingFace safetensors
     import time as _time
@@ -709,6 +708,24 @@ def main():
                     if profile_dir and global_step == 8 and is_main_process:
                         jax.profiler.stop_trace()
                         logger.info("Profiler stopped at step %d", global_step)
+
+                    # 第一步 forward 完成后立即诊断 Qwix 哪些 rule 没命中
+                    # （rule matching 在 forward trace 时发生，step 1 jit 编译完后才能查）
+                    if (not _qwix_diagnosed[0]
+                            and _qwix_provider is not None
+                            and is_main_process):
+                        _qwix_diagnosed[0] = True
+                        unused = _qwix_provider.get_unused_rules()
+                        if unused:
+                            paths = [r.module_path for r in unused]
+                            logger.warning(
+                                "Qwix unused rules (pattern matched 0 modules): %s",
+                                paths,
+                            )
+                        else:
+                            n_rules = (len(_qwix_provider._rules)
+                                       if hasattr(_qwix_provider, '_rules') else -1)
+                            logger.info("Qwix: all %d rules matched at least one module", n_rules)
 
                     loss_val = float(metrics["loss"])
                     epoch_loss += loss_val

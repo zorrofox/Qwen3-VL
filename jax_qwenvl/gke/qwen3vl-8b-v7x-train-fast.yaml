@@ -109,7 +109,7 @@ spec:
         - name: BATCH_SIZE
           value: "4"
         - name: RUN_NAME
-          value: "qwen3vl-8b-v7x8-L1024-bs4-fp8-vit-bench"
+          value: "qwen3vl-8b-v7x8-L1024-bs4-fp8-bench"
         - name: ENABLE_FP8
           value: "True"
         - name: PRINT_MODULE_PATHS
