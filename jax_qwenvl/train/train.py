@@ -351,22 +351,36 @@ def main():
     if training_args.enable_fp8:
         import qwix  # noqa
         rules = [
-            # 文本 decoder 的 attention QKV/O 投影
+            # ── LLM decoder（36 层 × 7 kernel = 252）─────────────────────────
+            # Attention QKV/O 投影
             qwix.QuantizationRule(
                 module_path=r'.*(q_proj|k_proj|v_proj|o_proj)$',
                 weight_qtype=jnp.float8_e4m3fn,
                 act_qtype=jnp.float8_e4m3fn,
             ),
-            # 文本 decoder 的 FFN（SwiGLU: gate/up/down）
+            # FFN（SwiGLU: gate/up/down）
             qwix.QuantizationRule(
                 module_path=r'.*(gate_proj|up_proj|down_proj)$',
                 weight_qtype=jnp.float8_e4m3fn,
                 act_qtype=jnp.float8_e4m3fn,
             ),
-            # 不量化：vit blocks (qkv/proj/mlp)、deepstack merger、embed、lm_head
+            # ── Vision tower（27 层 ViT × 4 kernel + mergers = 116）──────────
+            # ViT blocks attention（combined QKV + output proj）
+            qwix.QuantizationRule(
+                module_path=r'.*visual/blocks_\d+/attn/(qkv|proj)$',
+                weight_qtype=jnp.float8_e4m3fn,
+                act_qtype=jnp.float8_e4m3fn,
+            ),
+            # ViT blocks MLP + DeepStack mergers + final merger（共用 linear_fc1/fc2 命名）
+            qwix.QuantizationRule(
+                module_path=r'.*visual/.*(linear_fc1|linear_fc2)$',
+                weight_qtype=jnp.float8_e4m3fn,
+                act_qtype=jnp.float8_e4m3fn,
+            ),
+            # 不量化：visual/patch_embed/proj（3D conv，输入边界），lm_head（vocab 投影，softmax 前）
         ]
         model = qwix.quantize_model(model, qwix.QtProvider(rules))
-        logger.info("Qwix QT wrappers attached (rules=%d, qtype=float8_e4m3fn)", len(rules))
+        logger.info("Qwix QT wrappers attached (rules=%d, qtype=float8_e4m3fn, scope=LLM+ViT)", len(rules))
 
     # 6. Load weights from HuggingFace safetensors
     import time as _time
